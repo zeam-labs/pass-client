@@ -5,14 +5,18 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { wrapMCPClientWithPayment } from '@x402/mcp'
-import { paymentsFor, selectorFor, paymentRefused, floorStrategy, learnFloor } from './client.mjs'
+import { paymentsFor, selectorFor, paymentRefused, paymentNotTaken, floorStrategy, learnFloor, untilAnswered, readsPaymentOnly, unhurried, PREFERRED } from './client.mjs'
+import { withAgent } from './agent.mjs'
 import { toClientEvmSigner } from '@x402/evm'
 import { FileClientChannelStorage } from '@x402/evm/batch-settlement/client/file-storage'
+import { computeChannelId, buildChannelConfig } from '@x402/evm/batch-settlement/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import { createPublicClient, createWalletClient, http, fallback, keccak256, toHex, getAddress } from 'viem'
 import { passRefund, rebaseChannel, sendSignedRefund, refundUrlBeside, refundUrlInTerms, readSeller, rememberRefundUrl, hearingMcp, withGrant } from './refund.mjs'
-import { LINE_META, PRICE_META, LINE_GONE, lineUrlOf, lineUrlBeside, timeOf, timeFromTerms, isTimeTag, bodyOf, codeOf, meterOf, timeTerms, buyFor, askedMicro, MIN_BUY_MS, openLine, lineOp } from './line.mjs'
-import { FETCH_TOOL, makeFetchTool } from './fetch.mjs'
+import { LINE_META, PRICE_META, LINE_GONE, lineUrlOf, lineUrlBeside, timeOf, timeFromTerms, isTimeTag, bodyOf, codeOf, meterOf, timeTerms, buyFor, askedMicro, MIN_BUY_MS, openLine, lineOp, marginFor, slowestFor, keepAhead } from './line.mjs'
+import { FETCH_TOOL, isFetchTool, makeFetchTool } from './fetch.mjs'
+import { makeSessions, sessionTrust, splitHint, httpTransport, mcpTransport, SESSION_MODES } from './session.mjs'
+import { setting, nameInForce, TAG } from './env.mjs'
 import * as chains from 'viem/chains'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
@@ -20,89 +24,141 @@ import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 
 const UPSTREAM =
-  process.env.X402_MCP_URL ?? process.env.X402_UPSTREAM ?? 'https://mcp.zeamprism.com/mcp'
-const KEY = process.env.X402_PRIVATE_KEY ?? process.env.PRISM_PRIVATE_KEY
-const NETWORK = process.env.X402_NETWORK ?? 'eip155:8453'
-const WANT = (process.env.X402_ASSET ?? '').toLowerCase()
-const NAME = process.env.X402_NAME ?? 'x402-bridge'
-const GRANT = process.env.X402_GRANT || null
+  setting('MCP_URL') ?? setting('UPSTREAM') ?? 'https://mcp.zeamprism.com/mcp'
+const KEY = setting('PRIVATE_KEY') ?? process.env.PRISM_PRIVATE_KEY
+const KEY_NAME = setting('PRIVATE_KEY') === undefined && process.env.PRISM_PRIVATE_KEY !== undefined ? 'PRISM_PRIVATE_KEY' : nameInForce('PRIVATE_KEY')
+const NETWORK = setting('NETWORK') ?? 'eip155:8453'
+const WANT = (setting('ASSET') ?? '').toLowerCase()
+const NAME = setting('NAME') ?? 'zeam-pass'
+const GRANT = setting('GRANT') || null
 const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
-const log = (...a) => console.error('[x402-bridge]', ...a)
+const log = (...a) => console.error(TAG, ...a)
 
 const argv = process.argv.slice(2)
 const flag = (name) => { const i = argv.indexOf(name); return i === -1 ? null : (argv[i + 1] ?? '') }
 const has = (name) => argv.includes(name)
 
+if (has('--version') || has('-v')) {
+  process.stdout.write(`${VERSION}\n`)
+  process.exit(0)
+}
+
 if (has('--help') || has('-h')) {
   process.stdout.write([
-    `x402-mcp-bridge ${VERSION} — pay for MCP tools with a wallet.`,
+    `zeam-pass ${VERSION} — the ZEAM :: Pass client: pay for MCP tools and paid URLs with a wallet.`,
     '',
-    '  With your key exported as X402_PRIVATE_KEY:',
+    '  With your key exported as PASS_PRIVATE_KEY:',
     '',
-    '    npx -y @zeam-labs/x402-mcp-bridge --call call_rpc \'{"chain":"base","method":"eth_blockNumber","params":[]}\'',
-    '    npx -y @zeam-labs/x402-mcp-bridge --tools',
-    '    npx -y @zeam-labs/x402-mcp-bridge --call x402_fetch \'{"url":"https://…","pay":false}\'',
-    '    npx -y @zeam-labs/x402-mcp-bridge --refund',
+    '    npx -y @zeampass/client --call call_rpc \'{"chain":"base","method":"eth_blockNumber","params":[]}\'',
+    '    npx -y @zeampass/client --tools',
+    '    npx -y @zeampass/client --call paid_fetch \'{"url":"https://…","pay":false}\'',
+    '    npx -y @zeampass/client --refund',
     '',
     'With no arguments it runs as an MCP stdio server.',
+    'Without a key: --tools, and --call of a free tool; --call of a paid tool prints the seller\'s terms and exits 1.',
     '',
-    'Env: X402_PRIVATE_KEY, X402_MCP_URL, X402_LINE=auto|on|off, X402_MAX_SPEND (micro-USD, 0 = no cap),',
-    '     X402_DEPOSIT_MULTIPLIER (default 40, minimum 3), X402_LINE_AHEAD_MS (default 2000),',
-    '     X402_GRANT, X402_SALT, X402_ASSET, X402_RPC_URL, X402_STATE_DIR.',
+    'Env: PASS_PRIVATE_KEY, PASS_MCP_URL, PASS_LINE=auto|on|off, PASS_MAX_SPEND (micro-USD, 0 = no cap),',
+    '     PASS_DEPOSIT_MULTIPLIER (default 40, minimum 3), PASS_LINE_AHEAD_MS (default 2000: line time kept ahead of a call),',
+    '     PASS_GRANT, PASS_SALT, PASS_ASSET, PASS_RPC_URL, PASS_STATE_DIR,',
+    '     PASS_SESSION=auto|on|off, PASS_SESSION_ESCROW and PASS_SESSION_FACTORY (the MPP session escrow this client may pay into, and its payee factory).',
+    '     Renamed from x402-mcp-bridge: every X402_ name still works, and so does the tool name x402_fetch.',
     '',
+    '  --help, --version   print this, or the version, and exit; neither contacts a server.',
     '  --refund            the seller sends back the unspent balance and the unburned line time.',
     '  --refund --self-send  a signed refund, sent from this key at its own gas.',
+    '  --refund --exit     leave an MPP session channel without the seller: the close request, then after the grace period the withdrawal.',
     '',
   ].join('\n'))
   process.exit(0)
 }
 
-const KEYLESS = !KEY || !/^0x[0-9a-fA-F]{64}$/.test(KEY)
-if (KEYLESS && (has('--call') || has('--refund'))) {
-  log('set X402_PRIVATE_KEY to a 0x-prefixed 32-byte key. It stays on this machine;')
+const keyProblem = (k) => {
+  if (/^0x[0-9a-fA-F]{64}$/.test(k)) return null
+  if (/\.\.\.|…|[<>]/.test(k)) return 'it is the placeholder from an example, not a key'
+  if (/^[0-9a-fA-F]{64}$/.test(k)) return 'it has no 0x in front'
+  const hex = /^0x([0-9a-fA-F]*)$/.exec(k)
+  if (hex) return `it has ${hex[1].length} hex digits after 0x, and a key has 64`
+  return 'it is not 0x followed by 64 hex digits'
+}
+const KEY_PROBLEM = KEY ? keyProblem(KEY) : null
+const KEYLESS = !KEY || KEY_PROBLEM !== null
+const NEEDS_KEY = has('--refund') || (has('--call') && isFetchTool(flag('--call')))
+if (KEY_PROBLEM && (has('--call') || has('--refund'))) {
+  log(`${KEY_NAME} is set and is not a key: ${KEY_PROBLEM}. Nothing was called.`)
+  log('A key is 0x followed by 64 hex digits. It stays on this machine and is never sent anywhere.')
+  process.exit(1)
+}
+if (KEYLESS && NEEDS_KEY) {
+  log(`set PASS_PRIVATE_KEY to a 0x-prefixed 32-byte key: ${has('--refund') ? '--refund' : flag('--call')} signs with it. It stays on this machine;`)
   log('it signs payment vouchers locally and is never sent anywhere.')
   process.exit(1)
 }
+if (KEY_PROBLEM) log(`${KEY_NAME} is set and is not a key: ${KEY_PROBLEM}. Running as if there were none.`)
 if (KEYLESS) log('no key: serving the catalog and the free tools; a paid call returns the quote, which says what a key needs')
 const account = KEYLESS ? null : privateKeyToAccount(KEY)
 const chainId = Number(String(NETWORK).split(':')[1])
 const chain = Object.values(chains).find((c) => c?.id === chainId)
 if (!chain) { log(`unknown network ${NETWORK}`); process.exit(1) }
 
-const stateDir = KEYLESS ? mkdtempSync(join(tmpdir(), 'x402-keyless-')) : process.env.X402_STATE_DIR ??
+const stateDir = KEYLESS ? mkdtempSync(join(tmpdir(), 'pass-client-keyless-')) : setting('STATE_DIR') ??
   join(homedir(), '.x402-mcp-bridge', new URL(UPSTREAM).host, account.address.toLowerCase())
 mkdirSync(stateDir, { recursive: true })
 
 const readers = [
-  ...(process.env.X402_RPC_URL ? [process.env.X402_RPC_URL] : []),
+  ...(setting('RPC_URL') ? [setting('RPC_URL')] : []),
   ...(chain.rpcUrls?.default?.http ?? []),
   new URL('/verify', UPSTREAM).toString(),
 ]
 const pub = createPublicClient({ chain, transport: fallback(readers.map(u => http(u))) })
 log(`chain reads: ${readers.map(u => new URL(u).host).join(' -> ')}` +
-  (process.env.X402_RPC_URL ? '' : '  (set X402_RPC_URL to put your own node first)'))
+  (setting('RPC_URL') ? '' : '  (set PASS_RPC_URL to put your own node first)'))
 
 let chosenAccept = null
-const selector = selectorFor(WANT, (a) => { chosenAccept = a }, log)
+let capBlocked = false
+let capWhy = null
+const blockedBy = (why, needed = null) => {
+  capBlocked = true
+  capWhy = { message: why, ...(needed !== null ? { needed: String(needed) } : {}) }
+  throw new Error(why)
+}
+const selector = selectorFor(WANT, (a) => {
+  chosenAccept = a
+  if (!overCap(a?.amount, a?.scheme === PREFERRED)) return
+  blockedBy(`this payment of ${a.amount} would pass PASS_MAX_SPEND. Nothing was signed.`)
+}, log)
 
 const storage = new FileClientChannelStorage({ directory: stateDir })
 let channelId = null
 const watchedStorage = {
   get: (k) => storage.get(k),
   delete: (k) => storage.delete(k),
-  set: (k, ctx) => { channelId = k; noteBilled(ctx); return storage.set(k, ctx) },
+  set: async (k, ctx) => { channelId = k; noteBilled(await storage.get(k).catch(() => undefined), ctx); return storage.set(k, ctx) },
 }
-try {
-  const f = readdirSync(join(stateDir, 'client')).find((n) => n.endsWith('.json'))
-  if (f) channelId = f.replace(/\.json$/, '')
-} catch {}
 
-const depositPolicy = { depositMultiplier: Number(process.env.X402_DEPOSIT_MULTIPLIER ?? 40) }
+const depositPolicy = { depositMultiplier: Number(setting('DEPOSIT_MULTIPLIER') ?? 40) }
 const floor = { micro: 0 }
+const raiseToFloor = floorStrategy(floor)
+const cappedDeposit = (ctx) => {
+  const raised = raiseToFloor(ctx)
+  const wanted = Number(raised ?? ctx.depositAmount)
+  if (!overCap(wanted)) return raised
+  const floored = raised !== undefined || /^0x(833589fcd6edb6e08f4c7c32d4f71b54bda02913|036cbd53842c5426634e7929541ec2318f3dcf7e)$/i.test(String(ctx.paymentRequirements?.asset ?? ''))
+  const need = Math.max(Number(ctx.minimumDepositAmount ?? 0), floored && floor.micro > 0 ? floor.micro : 0)
+  const fit = Math.floor(unitsOf(MAX_SPEND - spentMicroUSD - fetchSpent))
+  const deposit = Math.max(need, Math.min(wanted, fit))
+  if (overCap(deposit)) blockedBy(`paying ${ctx.requestAmount} takes a channel deposit of at least ${need}, which would pass PASS_MAX_SPEND. Nothing was signed. A deposit counts toward PASS_MAX_SPEND when it is signed.`, need)
+  log(`PASS_MAX_SPEND leaves room for a deposit of ${deposit}, not ${wanted}: depositing that`)
+  return String(deposit)
+}
 
-const MAX_SPEND = Number(process.env.X402_MAX_SPEND ?? 10_000_000)
+const MAX_SPEND = Number(setting('MAX_SPEND') ?? 10_000_000)
+let fetchSpent = 0
 let capReached = false
-let startedAt = null
+const signedBy = new WeakMap()
+let signedUnits = 0
+let paidUnits = 0
+let creditUnits = 0
+const depositBy = new WeakMap()
 let spentMicroUSD = 0
 let quoteMicroUSD = null
 let spendUnit = 'micro-USD'
@@ -116,24 +172,89 @@ const quoteFromTerms = (j) => {
   return null
 }
 
+const quotedUnits = () => {
+  const asset = String(chosenAccept?.asset ?? '').toLowerCase()
+  const row = [...(tickAccepts?.accepts ?? []), ...(accepts?.accepts ?? [])].find((r) => String(r.asset ?? '').toLowerCase() === asset)
+  return Number(row?.amount ?? chosenAccept?.amount ?? 0)
+}
+
 const microUSDOf = (units) => {
-  const quoted = Number(chosenAccept?.amount ?? 0)
+  const quoted = quotedUnits()
   if (quoteMicroUSD === null || !(quoted > 0)) return units
   return units * (quoteMicroUSD / quoted)
 }
 
-const noteBilled = (ctx) => {
+const unitsOf = (micro) => {
+  const quoted = quotedUnits()
+  if (quoteMicroUSD === null || !(quoted > 0)) return micro
+  return micro * (quoted / quoteMicroUSD)
+}
+
+const overCap = (units, fromCredit = false) => {
+  const n = Number(units)
+  if (!MAX_SPEND || !Number.isFinite(n) || !(n > 0)) return false
+  return spentMicroUSD + fetchSpent + microUSDOf(fromCredit ? Math.max(0, n - creditUnits) : n) > MAX_SPEND
+}
+const roomMicro = () => (MAX_SPEND ? MAX_SPEND - spentMicroUSD - fetchSpent + microUSDOf(creditUnits) : Infinity)
+
+const chargedIn = (ctx) => Number(BigInt(ctx?.chargedCumulativeAmount ?? 0))
+
+const noteSigned = ({ paymentPayload, selectedRequirements }) => {
+  const d = paymentPayload?.payload?.type === 'deposit' ? Number(paymentPayload.payload.deposit?.amount) : 0
+  if (Number.isFinite(d) && d > 0) {
+    depositBy.set(paymentPayload, d)
+    creditUnits += d
+    notePaid(d)
+  }
+  const n = Number(selectedRequirements?.amount)
+  if (!Number.isFinite(n) || !(n > 0)) return
+  if (selectedRequirements?.scheme !== PREFERRED) { notePaid(n); return }
+  signedBy.set(paymentPayload, n)
+  signedUnits += n
+}
+
+const notTaken = (out) => paymentNotTaken(out) || codeOf(out) === 'funding_requires_open_fee'
+
+const unDeposit = (paymentPayload) => {
+  const d = depositBy.get(paymentPayload)
+  if (!d) return
+  depositBy.delete(paymentPayload)
+  creditUnits = Math.max(0, creditUnits - d)
+  paidUnits = Math.max(0, paidUnits - d)
+  spentMicroUSD = Math.max(0, spentMicroUSD - microUSDOf(d))
+}
+
+const noteAnswer = ({ paymentPayload, result, settleResponse }) => {
+  const accepted = paymentPayload?.accepted ?? chosenAccept
+  if (accepted?.scheme !== PREFERRED) return
+  if (settleResponse ? settleResponse.success !== false : !notTaken(result)) return
+  signedUnits = Math.max(0, signedUnits - (signedBy.get(paymentPayload) ?? 0))
+  signedBy.delete(paymentPayload)
+  unDeposit(paymentPayload)
+}
+
+const noteBilled = (was, ctx) => {
+  let mine = 0
   try {
-    const charged = Number(BigInt(ctx?.chargedCumulativeAmount ?? 0))
+    const charged = chargedIn(ctx)
     if (!Number.isFinite(charged)) return
-    if (startedAt === null) startedAt = charged
-    const spent = microUSDOf(charged - startedAt)
-    if (spent > spentMicroUSD) spentMicroUSD = spent
+    const rose = was ? charged - chargedIn(was) : charged
+    mine = Math.max(0, Math.min(rose, signedUnits))
+    signedUnits -= mine
   } catch {}
-  if (!MAX_SPEND || capReached || spentMicroUSD < MAX_SPEND) return
+  const drawn = Math.min(mine, creditUnits)
+  creditUnits -= drawn
+  notePaid(mine - drawn)
+}
+
+const notePaid = (units) => {
+  paidUnits += units
+  const spent = microUSDOf(paidUnits)
+  if (spent > spentMicroUSD) spentMicroUSD = spent
+  if (!MAX_SPEND || capReached || spentMicroUSD < MAX_SPEND || creditUnits > 0) return
   capReached = true
   log(`SPEND CAP REACHED — this run has spent ${spentMicroUSD} ${spendUnit} against a cap of ` +
-    `${MAX_SPEND}. Paying for nothing further. Raise or remove it with X402_MAX_SPEND.`)
+    `${MAX_SPEND}. Paying for nothing further. Raise or remove it with PASS_MAX_SPEND.`)
   letGo('spend cap reached')
 }
 
@@ -143,8 +264,8 @@ const saltOf = (raw) => {
   return keccak256(toHex(v))
 }
 
-const CARD_PAYER = process.env.X402_PAYER_ADDRESS
-  ? getAddress(process.env.X402_PAYER_ADDRESS) : null
+const CARD_PAYER = setting('PAYER_ADDRESS')
+  ? getAddress(setting('PAYER_ADDRESS')) : null
 
 const cardSigner = CARD_PAYER ? {
   address: CARD_PAYER,
@@ -163,13 +284,45 @@ if (CARD_PAYER && account) {
 
 const payments = KEYLESS ? null : paymentsFor({ signer: cardSigner ?? account, pub, network: NETWORK, selector, batch: {
     depositPolicy,
-    depositStrategy: floorStrategy(floor),
+    depositStrategy: cappedDeposit,
     storage: watchedStorage,
     ...(CARD_PAYER ? { payerAuthorizer: account.address, voucherSigner: toClientEvmSigner(account, pub) } : {}),
-    ...(process.env.X402_SALT ? { salt: saltOf(process.env.X402_SALT) } : {}),
+    ...(setting('SALT') ? { salt: saltOf(setting('SALT')) } : {}),
   } })
+payments?.onAfterPaymentCreation(noteSigned)
 
-const net = withGrant(fetch, GRANT)
+const bare = withAgent(unhurried())
+const net = withGrant(bare, GRANT, UPSTREAM)
+
+const budget = {
+  allows: (units) => !MAX_SPEND || spentMicroUSD + fetchSpent + units <= MAX_SPEND,
+  spend: (units) => { fetchSpent += units },
+}
+const SESSION_MODE = (setting('SESSION') ?? 'auto').toLowerCase()
+let sessions = null
+if (!KEYLESS && !cardSigner) {
+  try {
+    if (!SESSION_MODES.includes(SESSION_MODE)) throw new Error(`PASS_SESSION is ${SESSION_MODES.join(', ')}; it is set to ${SESSION_MODE}`)
+    sessions = makeSessions({ signer: account, pub, network: NETWORK, mode: SESSION_MODE, budget, log,
+      trust: sessionTrust({ chainId, escrows: setting('SESSION_ESCROW'), factories: setting('SESSION_FACTORY') }),
+      depositMultiplier: depositPolicy.depositMultiplier, baseSalt: setting('SALT') ? saltOf(setting('SALT')) : null,
+      relayUrl: setting('RELAY_URL') || undefined, relayFetch: bare, split: splitHint(setting('SESSION_SPLIT')), maxMicroUSD: MAX_SPEND })
+  } catch (e) { log(`${e.message}. Nothing was called.`); process.exit(1) }
+  if (SESSION_MODE !== 'off' && sessions.trust.any) log(`MPP sessions: pays into ${sessions.trust.list.map((e) => `${e.escrow} (${e.from})`).join(', ')}`)
+}
+const reached = new Map()
+const mcpAt = async (url) => {
+  if (!reached.has(url)) {
+    const c = readsPaymentOnly(new Client({ name: NAME, version: VERSION }))
+    reached.set(url, c.connect(new StreamableHTTPClientTransport(new URL(url), { fetch: net })).then(() => c))
+  }
+  return reached.get(url)
+}
+const sessionRoute = (r) => {
+  if (r.resource?.transport === 'http') return httpTransport({ fetchFn: net, url: r.resource.url, method: r.resource.method ?? 'POST', network: NETWORK })
+  if (r.resource?.transport === 'mcp') return mcpTransport({ callTool: async (p) => (await mcpAt(r.resource.url)).callTool(p), name: r.resource.tool, network: NETWORK })
+  return null
+}
 const termsURL = new URL('/.well-known/x402', UPSTREAM).toString()
 
 const seller = { time: null, lineUrl: null, refund: readSeller(stateDir).refund ?? null, tags: null }
@@ -182,17 +335,81 @@ const learnTerms = (t) => {
   if (r && !seller.refund) { seller.refund = r; rememberRefundUrl(stateDir, r) }
 }
 
+let accepts = null
+let tickAccepts = null
+const loadTerms = async () => {
+  const r = await net(termsURL, { signal: AbortSignal.timeout(10_000) }).catch((e) => { throw new Error(`${termsURL} could not be reached (${e.message})`) })
+  const j = await r.json().catch(() => null)
+  if (!j || typeof j !== 'object' || (!r.ok && !Array.isArray(j.accepts))) throw new Error(`the seller publishes no terms document at ${termsURL} (it answered ${r.status}${r.ok ? ', not JSON' : ''})`)
+  if (!Array.isArray(j.accepts) || !j.accepts.length) throw new Error(`the terms document at ${termsURL} lists no accepts`)
+  learnTerms(j)
+  accepts = { x402Version: j.x402Version ?? 1, accepts: j.accepts }
+  tickAccepts = Array.isArray(j.tickAccepts) && j.tickAccepts.length
+    ? { x402Version: j.x402Version ?? 1, accepts: j.tickAccepts }
+    : accepts
+  const q = quoteFromTerms(j)
+  if (q !== null) {
+    if (q !== quoteMicroUSD) log(`quote: ${q} micro-USD per call, from the seller's own terms`)
+    quoteMicroUSD = q; spendUnit = 'micro-USD'
+  } else if (quoteMicroUSD === null) {
+    spendUnit = 'base units of the paid asset'
+    log('quote: this server publishes no micro-USD price, so PASS_MAX_SPEND is read as base units of the asset, not dollars.')
+  }
+  return accepts
+}
+try { await loadTerms(); log(`terms cached from ${termsURL} — paying without probing`) }
+catch (e) { log(`${e.message}; falling back to the terms in the seller's 402`) }
+
+const EFFECTIVE_SALT = setting('SALT') ? saltOf(setting('SALT')) : `0x${'00'.repeat(32)}`
+const channelConfigDeps = {
+  signer: { address: (cardSigner ?? account)?.address },
+  payerAuthorizer: CARD_PAYER ? account.address : undefined,
+  voucherSigner: CARD_PAYER ? { address: account.address } : undefined,
+  salt: EFFECTIVE_SALT,
+}
+const saltChannel = (reqs) => {
+  try { return computeChannelId(buildChannelConfig(channelConfigDeps, reqs), reqs.network).toLowerCase() } catch { return null }
+}
+const channelForThisSalt = () => {
+  if (KEYLESS || !accepts) return null
+  const reqs = selectorFor(WANT)(accepts.x402Version, accepts.accepts)
+  return reqs ? saltChannel(reqs) : null
+}
+const channelFiles = () => { try { return readdirSync(join(stateDir, 'client')).filter((n) => n.toLowerCase().endsWith('.json')) } catch { return [] } }
+const SALT_CHANNEL = channelForThisSalt()
+if (SALT_CHANNEL) {
+  if (channelFiles().some((n) => n.toLowerCase() === `${SALT_CHANNEL}.json`)) channelId = SALT_CHANNEL
+} else {
+  const f = channelFiles()[0]
+  if (f) channelId = f.replace(/\.json$/i, '')
+}
+
 if (has('--refund')) {
-  if (!channelId) { process.stderr.write('no channel to refund — nothing has been bought with this key and salt\n'); process.exit(2) }
   const selfSend = has('--self-send')
+  const left = sessions ? await sessions.leave({ dir: stateDir, transportFor: sessionRoute, forced: has('--exit'), selfSend,
+    wallet: selfSend ? createWalletClient({ account, chain, transport: http(setting('RPC_URL') ?? chain.rpcUrls.default.http[0]) }) : null }) : []
+  for (const a of left) {
+    process.stdout.write(JSON.stringify(a, null, 2) + '\n')
+    if (a.op === 'session_closed') log(`session channel ${a.channelId}: ${a.returned} returned, ${a.settled} paid to the seller${a.gas ? `; ${a.gas} of what returned paid the gas, in USDC` : ''}`)
+    else if (a.op === 'session_exit_requested' && a.withdrawal) log(`session channel ${a.channelId}: close requested without the seller; the relay sends the withdrawal after ${a.readyAt ?? `the grace period (${a.graceSecs}s from the request's block)`} and takes ${a.gasMicroUSD} micro-USD of gas from what returns. Nothing more to send; --refund after that shows it closed${a.note ? `. ${a.note}` : ''}`)
+    else if (a.op === 'session_exit_requested') log(`session channel ${a.channelId}: close requested without the seller; run --refund again after ${a.readyAt ?? `the grace period (${a.graceSecs}s from the request's block)`} to withdraw`)
+    else if (a.op === 'session_exit_waiting' && a.withdrawal) log(`session channel ${a.channelId}: ${a.why}`)
+    else if (a.op === 'session_exit_waiting') log(`session channel ${a.channelId}: the withdrawal can be sent after ${a.readyAt}; run --refund again then`)
+    else log(`session channel ${a.channelId}: ${a.why}${a.op === 'session_close_failed' ? ' --refund --exit leaves without the seller: a close request through the relay, then the withdrawal after the grace period.' : ''}`)
+  }
+  const sessionsLeft = left.some((a) => a.op !== 'session_closed')
+  if (!channelId) {
+    if (!left.length) { process.stderr.write('no channel to refund — nothing has been bought with this key and salt\n'); process.exit(2) }
+    process.exit(sessionsLeft ? 1 : 0)
+  }
   if (!seller.refund) {
     try { learnTerms(await (await net(termsURL, { signal: AbortSignal.timeout(10_000) })).json()) } catch {}
   }
   const url = seller.refund ?? refundUrlBeside(UPSTREAM)
   log(`asking for the refund at ${url}`)
-  let answer = await passRefund({ url, channelId, signer: account, payer: CARD_PAYER ? null : account, selfSend, fetchFn: net, log })
+  let answer = await passRefund({ url, channelId, signer: account, payer: CARD_PAYER ? null : account, selfSend, relayUrl: setting('RELAY_URL') || undefined, maxMicroUSD: MAX_SPEND, budget, chainId, fetchFn: net, relayFetchFn: bare, log })
   if (answer.op === 'refund_signed') {
-    const wallet = createWalletClient({ account, chain, transport: http(process.env.X402_RPC_URL ?? chain.rpcUrls.default.http[0]) })
+    const wallet = createWalletClient({ account, chain, transport: http(setting('RPC_URL') ?? chain.rpcUrls.default.http[0]) })
     answer = await sendSignedRefund({ answer, account, pub, wallet, storage, channelId, log }).catch((e) => ({ ...answer, sent: false, why: `${answer.why ?? ''} Could not send it from here: ${e?.shortMessage ?? e?.message}`.trim() }))
   }
   if (answer.op === 'refunded' && answer.channelState && answer.gasPaidBy !== 'you') {
@@ -203,14 +420,14 @@ if (has('--refund')) {
   process.stdout.write(JSON.stringify(answer, null, 2) + '\n')
   if (answer.op === 'refunded') {
     if (answer.returnedMicroUSD !== undefined) log(`returned ${answer.returnedMicroUSD} micro-USD, gas ${answer.gasMicroUSD ?? 0} micro-USD${answer.gasPaidBy === 'you' ? ' paid in ETH by this key' : ''}${answer.timeReturnedMs ? `, ${answer.timeReturnedMs} ms of unburned line time included` : ''}`)
-    process.exit(0)
+    process.exit(sessionsLeft ? 1 : 0)
   }
   if (answer.code === 'nothing_to_return') {
     const left = Number(answer.leftMicroUSD ?? 0)
     log(left > 0
       ? `nothing comes back: ${left} micro-USD is left and sending it costs ${answer.gasMicroUSD ?? '?'} micro-USD of gas. --refund --self-send gets a signed refund of all of it to send at your own gas.`
-      : 'nothing comes back: this channel is fully spent')
-    process.exit(left > 0 ? 1 : 0)
+      : 'nothing comes back: this channel holds nothing')
+    process.exit(left > 0 || sessionsLeft ? 1 : 0)
   }
   if (answer.op === 'refund_signed') {
     log('the refund is signed and yours to send: any wallet on Base can send the transaction above')
@@ -226,15 +443,12 @@ if (has('--refund')) {
   process.exit(1)
 }
 
-const plain = new Client({ name: NAME, version: VERSION })
 const heard = new AsyncLocalStorage()
-const rawCallTool = plain.callTool.bind(plain)
-plain.callTool = async (...a) => {
-  const r = await rawCallTool(...a)
-  const s = heard.getStore()
-  if (s) s.raw = r
-  return r
-}
+const asked = new AsyncLocalStorage()
+const plain = untilAnswered(new Client({ name: NAME, version: VERSION }), {
+  heard: (r) => { const s = heard.getStore(); if (s) s.raw = r },
+  signal: () => asked.getStore() ?? null,
+})
 const whole = async (fn) => {
   const s = { raw: null }
   const out = await heard.run(s, fn)
@@ -245,7 +459,7 @@ const whole = async (fn) => {
 const upstream = KEYLESS
   ? { connect: (t) => plain.connect(t), listTools: () => plain.listTools(),
       callTool: (name, args) => plain.callTool({ name, arguments: args ?? {} }) }
-  : wrapMCPClientWithPayment(plain, payments, { autoPayment: true })
+  : wrapMCPClientWithPayment(plain, payments, { autoPayment: true }).onAfterPayment(noteAnswer)
 const callFree = (name, args) => whole(() => upstream.callTool(name, args))
 const callPaid = (name, args, payload) => whole(() => upstream.callToolWithPayment(name, args, payload))
 const callOnLineRaw = (name, args, credential) => plain.callTool({ name, arguments: args, _meta: { [LINE_META]: credential } })
@@ -253,30 +467,6 @@ const callOnLineRaw = (name, args, credential) => plain.callTool({ name, argumen
 const hearing = hearingMcp(net, (u) => { seller.refund = u; rememberRefundUrl(stateDir, u) }, learnTerms)
 await upstream.connect(new StreamableHTTPClientTransport(new URL(UPSTREAM), { fetch: hearing }))
 log(KEYLESS ? `catalog from ${UPSTREAM}, paying nothing` : `paying as ${account.address} -> ${UPSTREAM}`)
-
-let accepts = null
-let tickAccepts = null
-const loadTerms = async () => {
-  const r = await net(termsURL, { signal: AbortSignal.timeout(10_000) })
-  const j = await r.json()
-  if (!Array.isArray(j.accepts) || !j.accepts.length) throw new Error('no accepts in well-known')
-  learnTerms(j)
-  accepts = { x402Version: j.x402Version ?? 1, accepts: j.accepts }
-  tickAccepts = Array.isArray(j.tickAccepts) && j.tickAccepts.length
-    ? { x402Version: j.x402Version ?? 1, accepts: j.tickAccepts }
-    : accepts
-  const q = quoteFromTerms(j)
-  if (q !== null) {
-    if (q !== quoteMicroUSD) log(`quote: ${q} micro-USD per call, from the seller's own terms`)
-    quoteMicroUSD = q; spendUnit = 'micro-USD'
-  } else if (quoteMicroUSD === null) {
-    spendUnit = 'base units of the paid asset'
-    log('quote: this server publishes no micro-USD price, so X402_MAX_SPEND is read as base units of the asset, not dollars.')
-  }
-  return accepts
-}
-try { await loadTerms(); log(`terms cached from ${termsURL} — paying without probing`) }
-catch (e) { log(`could not cache terms (${e.message}); paying on the seller's 402`) }
 
 const learnTools = (tools) => {
   seller.tags = new Map(tools.map((t) => [t.name, t._meta?.[PRICE_META] ?? null]))
@@ -305,6 +495,11 @@ const available = async () => {
     if (!c?.balance || c.chargedCumulativeAmount === undefined) return null
     return Number(BigInt(c.balance) - BigInt(c.chargedCumulativeAmount))
   } catch { return null }
+}
+
+const deposited = async () => {
+  if (!channelId) return 0n
+  try { return BigInt((await storage.get(channelId))?.balance ?? 0) } catch { return 0n }
 }
 
 const needsTopUp = async (terms) => {
@@ -358,6 +553,7 @@ const payNow = async (name, args) => {
       }
       return out
     } catch (e) {
+      if (asked.getStore()?.aborted || capBlocked) throw e
       if (attempt === 2) { log(`pay-first failed twice (${e.message}); paying on the seller's 402`); return callFree(name, args) }
       try { await loadTerms() } catch {}
     }
@@ -380,13 +576,15 @@ const explainPermit2 = (out) => {
 
 if (!KEYLESS) log(`channel state in ${stateDir}`)
 
-const LINE_MODE = (process.env.X402_LINE ?? 'auto').toLowerCase()
-const AUTO_FAST_RUN = Number(process.env.X402_AUTO_FAST_RUN ?? 2)
-const AUTO_GAP_MS = Number(process.env.X402_AUTO_GAP_MS ?? 10_000)
-const AHEAD_MS = Number(process.env.X402_LINE_AHEAD_MS ?? 2000)
-const IDLE_MS = Number(process.env.X402_LINE_IDLE_MS ?? 1000)
+const LINE_MODE = (setting('LINE') ?? 'auto').toLowerCase()
+const AUTO_FAST_RUN = Number(setting('AUTO_FAST_RUN') ?? 2)
+const AUTO_GAP_MS = Number(setting('AUTO_GAP_MS') ?? 10_000)
+const AHEAD_MS = Number(setting('LINE_AHEAD_MS') ?? 2000)
+const IDLE_MS = Number(setting('LINE_IDLE_MS') ?? 1000)
 
-const line = { credential: null, msRemaining: 0, metering: false, opening: null, offTimer: null, buys: 0 }
+const line = { credential: null, channel: null, msRemaining: 0, readAt: 0, metering: false, opening: null, offTimer: null, buys: 0, riding: 0, calls: 0, keeper: null, slowestBuyMs: 0, slowestDepositMs: 0, depositNext: false, capped: false, release: null }
+const meterReads = (ms) => { line.msRemaining = Number(ms); line.readAt = Date.now() }
+const margin = () => marginFor(AHEAD_MS, slowestFor({ plainMs: line.slowestBuyMs, depositMs: line.slowestDepositMs, depositNext: line.depositNext }))
 const rate = { lastCallAt: 0, run: 0 }
 const lineUrl = () => seller.lineUrl ?? lineUrlBeside(UPSTREAM)
 
@@ -403,22 +601,31 @@ const dropLine = (why) => {
   const credential = line.credential
   if (credential) log(`line let go (${why})`)
   line.credential = null
+  line.channel = null
   line.metering = false
   return credential
 }
 
-const letGo = async (why) => {
+let closing = Promise.resolve()
+const letGo = (why, { leaving = false } = {}) => {
+  if (line.riding > 0 && !leaving) { line.release = why; return closing }
+  line.release = null
   const credential = dropLine(why)
-  if (!credential) return
-  await lineOp({ url: lineUrl(), op: 'off', credential, fetchFn: net }).catch(() => {})
-  await lineOp({ url: lineUrl(), op: 'close', credential, fetchFn: net }).catch(() => {})
+  if (!credential) return closing
+  closing = closing.then(async () => {
+    await lineOp({ url: lineUrl(), op: 'off', credential, fetchFn: net }).catch(() => {})
+    await lineOp({ url: lineUrl(), op: 'close', credential, fetchFn: net }).catch(() => {})
+  })
+  return closing
 }
 
 const touch = () => {
   if (line.offTimer) clearTimeout(line.offTimer)
+  line.offTimer = null
+  if (line.riding > 0) return
   line.offTimer = setTimeout(() => {
     line.offTimer = null
-    if (!line.credential || !line.metering) return
+    if (!line.credential || !line.metering || line.riding > 0) return
     line.metering = false
     lineOp({ url: lineUrl(), op: 'off', credential: line.credential, fetchFn: net })
       .then((a) => { if (a.op === 'off') log(`meter off after ${IDLE_MS} ms idle; ${a.msRemaining ?? line.msRemaining} ms held`) })
@@ -435,8 +642,9 @@ const holdLine = () => {
     const o = await openLine({ url: lineUrl(), channelId, signer: account, fetchFn: net })
     if (o.op !== 'opened') { log(`line not opened: ${o.code}${o.why ? ` (${o.why})` : ''}`); return false }
     line.credential = o.credential
+    line.channel = String(channelId).toLowerCase()
     line.metering = o.metering !== false
-    line.msRemaining = Number(o.msRemaining ?? 0)
+    meterReads(o.msRemaining ?? 0)
     log(`line open at ${lineUrl()}: ${line.msRemaining} ms on the meter`)
     return true
   })().finally(() => { line.opening = null })
@@ -446,54 +654,132 @@ const holdLine = () => {
 const meterOn = async () => {
   if (line.metering) return true
   const a = await lineOp({ url: lineUrl(), op: 'on', credential: line.credential, fetchFn: net })
-  if (a.op === 'on') { line.metering = true; line.msRemaining = Number(a.msRemaining ?? line.msRemaining); return true }
+  if (a.op === 'on') { line.metering = true; meterReads(a.msRemaining ?? line.msRemaining); return true }
   if (LINE_GONE.has(a.code)) dropLine(a.code)
   return false
 }
 
-const buyTime = async (wantMs) => {
+const buyTime = async (wantMs, enough = () => false) => {
   if (!seller.time) await tagOf('buy_time')
   if (!seller.time) return false
-  const buy = buyFor({ wantMs, time: seller.time, availableMicro: await available() })
-  const out = await payFirst('buy_time', buy.args)
+  if (line.credential && line.channel && channelId && line.channel !== String(channelId).toLowerCase()) {
+    log(`the line rides ${line.channel} but a purchase would go to ${String(channelId).toLowerCase()}: not buying time against a channel the line does not ride. Keep PASS_STATE_DIR and PASS_SALT steady between runs, or run --refund.`)
+    return false
+  }
+  const buy = buyFor({ wantMs, time: seller.time, availableMicro: await available(), depositMultiplier: depositPolicy.depositMultiplier })
+  let took = 0
+  let carried = false
+  let skipped = false
+  const out = await asked.run(null, () => oneAtATime(async () => {
+    if (enough()) { skipped = true; return null }
+    const held = await deposited()
+    const from = Date.now()
+    try {
+      const o = await payNow('buy_time', buy.args)
+      const r = bodyOf(o)
+      if (!o?.isError && Number.isFinite(Number(r?.msRemaining))) meterReads(r.msRemaining)
+      return o
+    } finally { took = Date.now() - from; carried = (await deposited()) > held }
+  }))
+  if (skipped) return true
   const b = bodyOf(out)
   if (out?.isError || !b) { log(`buy_time: ${codeOf(out) ?? reasonFrom(out) ?? 'no answer'}`); return false }
   line.buys += 1
-  if (Number.isFinite(Number(b.msRemaining))) line.msRemaining = Number(b.msRemaining)
+  if (carried) line.slowestDepositMs = Math.max(line.slowestDepositMs, took)
+  else line.slowestBuyMs = Math.max(line.slowestBuyMs, took)
+  const covered = await available()
+  line.depositNext = covered !== null && covered < buyFor({ wantMs: 0, time: seller.time }).micro
   log(`bought ${b.boughtMs ?? buy.ms} ms of line time for ${buy.micro} micro-USD; ${line.msRemaining} ms on the meter`)
   return true
 }
 
 const ride = async (name, args, needMs = 0) => {
+  line.riding += 1
+  touch()
+  try {
+    return await rideLine(name, args, needMs)
+  } finally {
+    line.riding -= 1
+    touch()
+    if (line.riding === 0 && line.release !== null) { const why = line.release; line.release = null; letGo(why).catch(() => {}) }
+  }
+}
+
+const topUp = async (wantMs, have) => {
+  if (!seller.time) await tagOf('buy_time')
+  if (!seller.time) return false
+  const room = roomMicro()
+  const fits = Number.isFinite(room) ? Math.floor(room / seller.time.rateMicro) * seller.time.rateMs : wantMs
+  if (capReached || buyFor({ wantMs: 0, time: seller.time }).micro > room) {
+    line.capped = true
+    log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: no more line time is bought; the call runs on the ${Math.round(have)} ms left`)
+    return null
+  }
+  const blocked = capBlocked
+  let why = null
+  const ok = await buyTime(Math.min(wantMs, fits), () => lineLeft() > margin()).catch((e) => { why = e?.message ?? String(e); return false })
+  if (capBlocked && !blocked) { capBlocked = blocked; line.capped = true; return null }
+  if (!ok) log(`could not buy more line time while a call runs${why ? ` (${why})` : ''}: it keeps running on the ${Math.round(Math.max(0, lineLeft()))} ms left`)
+  return ok
+}
+
+const lineLeft = () => line.msRemaining - (line.calls > 0 ? Date.now() - line.readAt : 0)
+
+const keeping = () => {
+  if (line.calls++ === 0) {
+    line.readAt = Date.now()
+    line.keeper = keepAhead({ margin, left: lineLeft, buy: topUp })
+  }
+  return () => {
+    if (--line.calls > 0) return
+    line.keeper.stop()
+    line.keeper = null
+  }
+}
+
+const rideLine = async (name, args, needMs = 0) => {
   let out = null
-  let want = Math.max(AHEAD_MS, Math.ceil(needMs * 1.25))
+  let want = Math.max(2 * margin(), Math.ceil(needMs * 1.25))
   let need = needMs > 0 ? want : MIN_BUY_MS
   for (let attempt = 0; attempt < 4; attempt++) {
     if (capReached) break
     if (!(await holdLine())) return null
     if (!(await meterOn())) { if (!line.credential) continue; return null }
-    if (line.msRemaining < need && !(await buyTime(Math.max(MIN_BUY_MS, want - line.msRemaining)))) return null
-    out = await callOnLineRaw(name, args, line.credential)
+    const fill = line.msRemaining < need ? want : need
+    for (let buys = 0; line.msRemaining < fill && buys < 3; buys++) {
+      const had = line.msRemaining
+      if (!(await buyTime(Math.max(MIN_BUY_MS, want - had), () => line.msRemaining >= fill))) { if (had >= MIN_BUY_MS) break; return null }
+      if (line.msRemaining <= had) break
+    }
+    const kept = keeping()
+    try { out = await callOnLineRaw(name, args, line.credential) } finally { kept() }
     const m = meterOf(out)
-    if (m && Number.isFinite(Number(m.msRemaining))) line.msRemaining = Number(m.msRemaining)
+    if (m && Number.isFinite(Number(m.msRemaining))) meterReads(m.msRemaining)
     const code = codeOf(out)
     const cut = code ? null : bodyOf(out)
-    if (cut?.error === 'out_of_time' && Number(cut.needsMs) > 0 && attempt === 0) {
+    if (code === 'out_of_time' || cut?.error === 'out_of_time') {
+      const endedAt = Date.now()
+      await oneAtATime(() => {})
+      if (code && line.readAt <= endedAt) meterReads(bodyOf(out)?.msRemaining ?? 0)
+      if (line.capped || capReached) {
+        log(`${name} ended when its line ran out of time: PASS_MAX_SPEND stopped the Pass client buying more`)
+        return capAnswer(`${name} ran until its line ran out of time and ended there unanswered: buying more time would go over the PASS_MAX_SPEND ceiling, so no more was bought. Raise it, set PASS_MAX_SPEND=0 to remove it, or restart the Pass client.`)
+      }
+    }
+    if (cut?.error === 'out_of_time' && Number(cut.needsMs) > 0 && attempt < 3) {
       const ran = Number(m?.elapsedMs)
-      want = Math.ceil(((Number.isFinite(ran) && ran > 0 ? ran : want) + Number(cut.needsMs)) * 1.25)
+      want = Math.ceil(((Number.isFinite(ran) && ran > 0 ? ran : want) + Number(cut.needsMs)) * 1.5)
       need = want
       log(`${name} was cut with about ${cut.needsMs} ms still to run; buying up to ${want} ms and calling it again`)
       continue
     }
     if (code === 'meter_off') { line.metering = false; continue }
     if (code === 'out_of_time') {
-      line.msRemaining = Number(bodyOf(out)?.msRemaining ?? 0)
       want *= 2
       log(`the line ran out of time on ${name}; buying ${want} ms and calling again`)
       continue
     }
     if (code && LINE_GONE.has(code)) { dropLine(code); continue }
-    touch()
     return out
   }
   return out
@@ -505,32 +791,89 @@ const reasonFrom = (out) => {
   return typeof why === 'string' && why ? why.slice(0, 160) : null
 }
 
-const capAnswer = () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
+const capAnswer = (message = 'This payment would go over the PASS_MAX_SPEND ceiling, so it was not made. ' +
+  'Raise it, set PASS_MAX_SPEND=0 to remove it, or restart the Pass client.', more = {}) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
   error: 'x402_bridge_spend_cap_reached',
-  spentMicroUSD, capMicroUSD: MAX_SPEND,
-  message: 'This bridge has spent its X402_MAX_SPEND ceiling and will not pay for more. ' +
-    'Raise it, set X402_MAX_SPEND=0 to remove it, or restart the bridge.' }) }] })
+  spentMicroUSD: spentMicroUSD + fetchSpent, capMicroUSD: MAX_SPEND,
+  message, ...more }) }] })
 
-let fetchSpent = 0
-const fetchTool = KEYLESS || cardSigner ? null : makeFetchTool({ signer: account, pub, network: NETWORK, grant: GRANT, log, budget: {
-  allows: (units) => !MAX_SPEND || spentMicroUSD + fetchSpent + units <= MAX_SPEND,
-  spend: (units) => { fetchSpent += units },
-} })
+const UPSTREAM_HOST = new URL(UPSTREAM).host
+const fetchState = (url) => {
+  if (url.host === UPSTREAM_HOST) return { dir: stateDir, storage, serial: oneAtATime, refund: '--refund' }
+  const dir = setting('STATE_DIR') ? join(stateDir, 'hosts', url.host, account.address.toLowerCase()) : join(homedir(), '.x402-mcp-bridge', url.host, account.address.toLowerCase())
+  return { dir, refund: `PASS_MCP_URL=${url.origin}${setting('STATE_DIR') ? ` PASS_STATE_DIR=${dir}` : ''} with --refund` }
+}
+const fetchTool = KEYLESS || cardSigner ? null : makeFetchTool({ signer: account, pub, network: NETWORK, grant: GRANT, seller: UPSTREAM, log, budget, stateFor: fetchState, depositMultiplier: depositPolicy.depositMultiplier, salt: setting('SALT') ? saltOf(setting('SALT')) : null, asset: WANT, sessions })
+
+const sessionTools = new Map()
+const bySession = (name, args, timed = false) => {
+  if (!sessions || SESSION_MODE === 'off' || !sessions.trust.any || sessionTools.get(name) === 'none') return undefined
+  return oneAtATime(async () => {
+    if (SESSION_MODE !== 'on' && !sessions.holds(stateDir) && (await available()) > 0) return undefined
+    const route = mcpTransport({ callTool: (p) => plain.callTool(p), name, args, network: NETWORK })
+    let known = sessionTools.get(name)
+    if (!known || Date.parse(known.offer.challenge.expires ?? '') - Date.now() < 30_000) {
+      const first = await route.probe()
+      if (!first.challenges.length && !Array.isArray(first.body?.accepts)) {
+        if (!timed || !first.out?.isError) return first.out
+        sessionTools.set(name, 'none')
+        return undefined
+      }
+      const offers = sessions.usable(first.offers).sort((a, b) => (a.amount < b.amount ? -1 : 1))
+      if (!offers.length) { sessionTools.set(name, 'none'); return undefined }
+      known = { offer: offers[0], terms: first.body }
+      sessionTools.set(name, known)
+    }
+    const { answer, error, message, ...facts } = await sessions.pay({ dir: stateDir, origin: new URL(UPSTREAM).origin, offer: known.offer, terms: known.terms, resource: { transport: 'mcp', url: UPSTREAM, tool: name }, send: route.send, signal: asked.getStore() ?? null })
+    if (!error) return answer.out
+    sessionTools.delete(name)
+    if (error === 'x402_bridge_spend_cap_reached') {
+      log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: ${name} was not paid for`)
+      return capAnswer(message)
+    }
+    log(`session: ${name} was not paid (${error}): ${message}`)
+    return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error, message, ...facts }) }] }
+  })
+}
 
 const callTool = async (name, args) => {
-  if (name === FETCH_TOOL.name && fetchTool) return fetchTool(args)
+  capBlocked = false
+  capWhy = null
+  let out
+  try {
+    out = await callWithin(name, args)
+  } catch (e) {
+    if (!capBlocked) throw e
+  }
+  if (!capBlocked) return out
+  log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: ${name} was not paid for`)
+  return capWhy ? capAnswer(`${capWhy.message} Raise PASS_MAX_SPEND, set it to 0 to remove it, or restart the Pass client.`, capWhy.needed ? { needed: capWhy.needed } : {}) : capAnswer()
+}
+
+const callWithin = async (name, args) => {
+  if (isFetchTool(name) && fetchTool) return fetchTool(args, { signal: asked.getStore() ?? undefined })
   if (capReached) return capAnswer()
   if (KEYLESS) return callFree(name, args)
   if (name === 'buy_time') {
     const out = await payFirst(name, args)
     const b = bodyOf(out)
-    if (!out?.isError && Number.isFinite(Number(b?.msRemaining))) line.msRemaining = Number(b.msRemaining)
+    if (!out?.isError && Number.isFinite(Number(b?.msRemaining))) meterReads(b.msRemaining)
     return out
   }
   const tag = await tagOf(name)
-  if (!isTimeTag(tag) || LINE_MODE === 'off') return payFirst(name, args)
-  const fast = callsKeepComing()
-  const worth = line.credential && line.msRemaining > 0 ? true : LINE_MODE === 'on' || fast
+  const timed = isTimeTag(tag)
+  const fast = timed && LINE_MODE !== 'off' ? callsKeepComing() : false
+  const riding = timed && LINE_MODE !== 'off' && (LINE_MODE === 'on' || Boolean(line.credential && line.msRemaining > 0))
+  if (!riding) {
+    const out = await bySession(name, args, timed)
+    if (out !== undefined) return out
+  }
+  if (!timed || LINE_MODE === 'off') return payFirst(name, args)
+  const worth = riding || fast
+  if (worth && !channelId && LINE_MODE === 'on') {
+    log(`${name} is sold by time: buying time first, so this call rides a line`)
+    await buyTime(AHEAD_MS)
+  }
   if (worth && channelId) {
     const out = await ride(name, args)
     if (out) return out
@@ -546,22 +889,22 @@ const callTool = async (name, args) => {
 }
 
 const told = typeof plain.getInstructions === 'function' ? plain.getInstructions() : null
-const BRIDGE_NOTE = KEYLESS
-  ? 'You are connected through the x402 Bridge with no wallet key: the free tools work, and a paid call returns the seller\'s terms.'
-  : 'You are connected through the x402 Bridge. It pays for paid tools from the wallet it was started with, and buys line time when a tool needs longer: do not call buy_time or line yourself. To take back what is unspent, the person runs the bridge once with --refund. No payment steps are needed from you; the seller\'s payment instructions below are for clients without the Bridge.'
-const server = new Server({ name: NAME, version: VERSION }, { capabilities: { tools: {} }, instructions: told ? `${BRIDGE_NOTE}\n\n${told}` : BRIDGE_NOTE })
+const CLIENT_NOTE = KEYLESS
+  ? 'You are connected through the ZEAM :: Pass client with no wallet key: the free tools work, and a paid call returns the seller\'s terms.'
+  : 'You are connected through the ZEAM :: Pass client. It pays for paid tools from the wallet it was started with, and buys line time when a tool needs longer: do not call buy_time or line yourself. To take back what is unspent, the person runs the Pass client once with --refund. No payment steps are needed from you; the seller\'s payment instructions below are for clients that connect without it.'
+const server = new Server({ name: NAME, title: 'ZEAM :: Pass client', version: VERSION }, { capabilities: { tools: {} }, instructions: told ? `${CLIENT_NOTE}\n\n${told}` : CLIENT_NOTE })
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const { tools } = await upstream.listTools()
   learnTools(tools)
   return { tools: fetchTool && !tools.some((t) => t.name === FETCH_TOOL.name) ? [...tools, FETCH_TOOL] : tools }
 })
-server.setRequestHandler(CallToolRequestSchema, (req) => callTool(req.params.name, req.params.arguments ?? {}))
+server.setRequestHandler(CallToolRequestSchema, (req, extra) => asked.run(extra?.signal ?? null, () => callTool(req.params.name, req.params.arguments ?? {})))
 
 let leaving = false
 const stopPaying = async (why) => {
   if (leaving) return
   leaving = true
-  await Promise.race([letGo(why), new Promise((r) => setTimeout(r, 3000))])
+  await Promise.race([letGo(why, { leaving: true }), new Promise((r) => setTimeout(r, 3000))])
   process.exit(0)
 }
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => stopPaying('shutting down'))
@@ -572,7 +915,7 @@ process.on('disconnect', () => stopPaying('parent disconnected'))
 
 const finish = async (code) => {
   leaving = true
-  await Promise.race([letGo('one-shot call finished'), new Promise((r) => setTimeout(r, 3000))])
+  await Promise.race([oneAtATime(() => letGo('one-shot call finished', { leaving: true })), new Promise((r) => setTimeout(r, 3000))])
   process.exit(code)
 }
 
@@ -599,6 +942,7 @@ if (has('--call')) {
       const text = out?.content?.[0]?.text
       process.stdout.write((typeof text === 'string' ? text : JSON.stringify(out)) + '\n')
       if (out?.isError) failed = true
+      if (KEYLESS && out?.isError && Array.isArray(bodyOf(out)?.accepts)) log(`no key: ${tool} is a paid tool and was not paid for; the seller's terms are on stdout. Set PASS_PRIVATE_KEY to pay.`)
     } catch (e) {
       process.stderr.write(`call failed: ${e.message}\n`)
       failed = true
@@ -609,6 +953,6 @@ if (has('--call')) {
 
 await server.connect(new StdioServerTransport())
 if (LINE_MODE === 'on' && channelId) await holdLine()
-log(`bridge up on stdio — line mode ${LINE_MODE}${channelId ? '' : ' (channel opens on your first call)'}` +
-  ` | spend cap ${MAX_SPEND ? MAX_SPEND + ' ' + spendUnit : 'NONE (X402_MAX_SPEND=0)'}` +
+log(`up on stdio — line mode ${LINE_MODE}${channelId ? '' : ' (channel opens on your first call)'}` +
+  ` | spend cap ${MAX_SPEND ? MAX_SPEND + ' ' + spendUnit : 'NONE (PASS_MAX_SPEND=0)'}` +
   ' | stops when stdin closes')

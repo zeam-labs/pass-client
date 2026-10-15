@@ -67,16 +67,42 @@ export const timeTerms = (terms, micro) => {
   return { ...terms, accepts: terms.accepts.map((a) => ({ ...a, amount: String((BigInt(a.amount ?? 0) * BigInt(micro)) / unit) })) }
 }
 
-export const buyFor = ({ wantMs, time, availableMicro = null }) => {
+export const buyFor = ({ wantMs, time, availableMicro = null, depositMultiplier = Infinity }) => {
   const least = Math.max(1, Math.ceil(MIN_BUY_MS / time.rateMs))
   const most = time.maxMs ? Math.max(1, Math.floor(time.maxMs / time.rateMs)) : Infinity
   let steps = Math.min(most, Math.max(least, Math.ceil(wantMs / time.rateMs)))
   if (availableMicro !== null && Number.isFinite(availableMicro)) {
     const fits = Math.floor(availableMicro / time.rateMicro)
-    steps = fits >= least ? Math.min(steps, fits) : Math.min(most, least)
+    steps = fits >= least ? Math.min(steps, fits) : Math.min(most, Math.max(least, Math.ceil(steps / depositMultiplier)))
   }
   const ms = steps * time.rateMs
   return { ms, micro: steps * time.rateMicro, args: time.buys === 'blocks' ? { blocks: steps } : { ms } }
+}
+
+export const marginFor = (aheadMs, slowestBuyMs = 0) => Math.max(aheadMs / 2, 2 * slowestBuyMs)
+
+export const slowestFor = ({ plainMs = 0, depositMs = 0, depositNext = false }) => (depositNext ? Math.max(plainMs, depositMs) : plainMs)
+
+export function keepAhead({ margin, left, buy }) {
+  const began = Date.now()
+  let on = true
+  let timer = null
+  let wake = () => {}
+  const pause = (ms) => new Promise((ok) => { wake = ok; timer = setTimeout(ok, Math.min(Math.max(1, ms), 2 ** 31 - 1)); timer.unref?.() })
+  const done = (async () => {
+    while (on) {
+      const m = margin()
+      const have = left()
+      if (have > m) { await pause(have - m); continue }
+      const got = await buy(Math.max(2 * m, Date.now() - began), Math.max(0, have))
+      if (!on || got === null) return
+      if (got) continue
+      const rest = left()
+      if (rest < MIN_BUY_MS) return
+      await pause(rest / 2)
+    }
+  })().catch(() => {})
+  return { done, stop: () => { on = false; clearTimeout(timer); wake() } }
 }
 
 export const askedMicro = (time, args, unitMicro) => {

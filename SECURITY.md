@@ -18,17 +18,32 @@ There is no bug bounty. We will credit you by name or handle if you want it.
 
 ## What this software does with your key
 
-`X402_PRIVATE_KEY` is read from the environment at startup and passed to `privateKeyToAccount` and
-`toClientEvmSigner` from `viem` and `@x402/evm`. It signs x402 vouchers and channel deposits locally.
-It is never transmitted, logged, or written to disk by this code.
+`PASS_PRIVATE_KEY` is read from the environment at startup and passed to `privateKeyToAccount` and
+`toClientEvmSigner` from `viem` and `@x402/evm`. It signs x402 vouchers, channel deposits and MPP
+charges locally. It is never transmitted, logged, or written to disk by this code.
 
-The bridge custodies nothing. Your funds sit as collateral in the upstream's settlement contract and
+The Pass client custodies nothing. Your funds sit as collateral in the upstream's settlement contract and
 are withdrawable by your signature alone, subject to that contract's withdraw delay.
 
-**Your exposure is the size of your deposit**, not the price of a call. The bridge pays automatically
+**Your exposure is the size of your deposit**, not the price of a call. The Pass client pays automatically
 against the terms the upstream quotes, up to the per-request ceiling, without asking you per call.
 Fund a channel with what you are willing to lose to a dishonest or broken meter, and use a key that
 holds nothing else.
+
+`paid_fetch` pays whatever URL it is given: an x402 `exact` payment, an MPP `evm` charge, or an x402
+`batch-settlement` channel. A channel takes a deposit, and the URL's own terms name its receiver, its
+floor and its withdraw delay. The Pass client signs no `paid_fetch` deposit above `maxAmount` or above
+what is left of `PASS_MAX_SPEND`, and counts each one against `PASS_MAX_SPEND` when it signs it. The
+receiver can claim only what the vouchers sign, one price per call. The rest of a deposit comes back by
+`--refund`, or with no answer from the seller by withdrawal after that delay. Channel records are kept
+per host, and a seller's answer is written only to the channel its own terms name.
+
+An MPP `session` is paid only into an escrow contract you pin with `PASS_SESSION_ESCROW`; none is built in. You
+are trusting that contract's code with the deposit. The Pass client signs no voucher above the deposit or above
+what the seller's receipts show spent plus the call being paid, signs no deposit or top-up that would pass
+`PASS_MAX_SPEND`, and refuses a receipt that claims more than it has signed. The seller can collect up to the
+highest voucher signed, one call's price above what its receipts show. The rest comes back by `--refund`, or
+without the seller by the escrow's close request and withdrawal after its grace period.
 
 ## In scope
 
@@ -44,23 +59,23 @@ holds nothing else.
   this client — the meter runs server-side and cannot be verified from here. Documented, not fixable.
 - Vulnerabilities in `viem`, `@x402/*`, or the MCP SDK. Report those upstream; tell us too and we
   will bump the pin.
-- Losing your own key or your own `X402_STATE_DIR`.
+- Losing your own key or your own `PASS_STATE_DIR`.
 
 ## Verifying what you are about to run
 
-The package is `@zeam-labs/x402-mcp-bridge` on npm. Check what you are about to run
-before you run it:
+The package is `@zeampass/client` on npm; until 4.0.0 it was `@zeam-labs/x402-mcp-bridge`. Check
+what you are about to run before you run it:
 
-    npm view @zeam-labs/x402-mcp-bridge dist.integrity version
-    npm pack @zeam-labs/x402-mcp-bridge && tar xzf zeam-labs-x402-mcp-bridge-*.tgz
+    npm view @zeampass/client dist.integrity version
+    npm pack @zeampass/client && tar xzf zeampass-client-*.tgz
     less package/index.mjs
 
 npm's integrity hash proves the bytes you fetched are the bytes that were published.
 It does not prove we are honest — read the source, it is short on purpose, and it matches this
 repository commit for commit.
 
-`npx -y @zeam-labs/x402-mcp-bridge` fetches the current release every launch, so a future version
-could differ from the one you audited. Pin the version you audited — `npx -y @zeam-labs/x402-mcp-bridge@<version>` — or
+`npx -y @zeampass/client` fetches the current release every launch, so a future version
+could differ from the one you audited. Pin the version you audited — `npx -y @zeampass/client@<version>` — or
 vendor the tarball at a known integrity hash and run it from disk. Dependencies are
 pinned to exact versions precisely so that the code under the code cannot move beneath you.
 

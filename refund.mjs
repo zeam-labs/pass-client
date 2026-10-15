@@ -1,5 +1,6 @@
-import { getAddress } from 'viem'
+import { getAddress, decodeFunctionData } from 'viem'
 import { BATCH_SETTLEMENT_ADDRESS } from '@x402/evm'
+import { computeChannelId } from '@x402/evm/batch-settlement/client'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -20,12 +21,49 @@ export const refundUrlOf = (terms) => (terms && typeof terms === 'object' ? refu
 
 export const refundUrlBeside = (upstream) => String(upstream).replace(/\/+$/, '').replace(/\/mcp$/, '') + '/refund'
 
-export const withGrant = (fetchFn, grant) => {
-  if (!grant) return fetchFn
-  return (input, init = {}) => {
-    const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+const originOf = (u) => { try { return new URL(String(u)).origin } catch { return null } }
+const REDIRECTS = new Set([301, 302, 303, 307, 308])
+const MAX_REDIRECTS = 20
+
+export const withGrant = (fetchFn, grant, seller) => {
+  const home = originOf(seller)
+  if (!grant || !home) return fetchFn
+  return async (input, init = {}) => {
+    const req = input instanceof Request ? input : null
+    const headers = new Headers(init.headers ?? req?.headers)
+    let at = req ? req.url : String(input)
+    if (originOf(at) !== home || headers.has(GRANT_HEADER)) return fetchFn(input, init)
     headers.set(GRANT_HEADER, grant)
-    return fetchFn(input, { ...init, headers })
+    let method = String(init.method ?? req?.method ?? 'GET').toUpperCase()
+    let body = init.body
+    const spare = req && body === undefined && req.body ? req.clone() : null
+    const signal = init.signal ?? req?.signal
+    let r = await fetchFn(input, { ...init, headers, redirect: 'manual' })
+    for (let hop = 0; hop < MAX_REDIRECTS; hop++) {
+      const to = REDIRECTS.has(r.status) ? r.headers.get('location') : null
+      if (!to) return r
+      let next
+      try { next = new URL(to, at) } catch { return r }
+      if (!/^https?:$/.test(next.protocol)) return r
+      const toGet = r.status === 303 ? method !== 'GET' && method !== 'HEAD' : r.status !== 307 && r.status !== 308 && method === 'POST'
+      if (toGet) {
+        method = 'GET'
+        body = undefined
+        for (const h of ['content-type', 'content-length', 'content-encoding', 'content-language', 'content-location']) headers.delete(h)
+      } else if (body === undefined && spare) body = await spare.arrayBuffer()
+      await r.body?.cancel().catch(() => {})
+      const onward = { ...init, method, headers, ...(signal ? { signal } : {}) }
+      if (toGet) delete onward.body
+      else if (body !== undefined) onward.body = body
+      if (next.origin !== home) {
+        headers.delete(GRANT_HEADER)
+        headers.delete('authorization')
+        return fetchFn(next, onward)
+      }
+      at = next
+      r = await fetchFn(next, { ...onward, redirect: 'manual' })
+    }
+    return r
   }
 }
 
@@ -121,7 +159,38 @@ export async function askPassRefund({ url, channelId, signer, extra = {}, fetchF
   return { status: r.status, ...j }
 }
 
-export async function passRefund({ url, channelId, signer, payer = signer, selfSend = false, fetchFn = fetch, now = Date.now, wait = sleep, tries = 6, log = () => {} }) {
+export const RELAY_URL = 'https://api.zeampass.com/relay'
+const USDC_ON = { 8453: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', 84532: '0x036cbd53842c5426634e7929541ec2318f3dcf7e' }
+const QUOTE_ROOM = 2
+
+export async function gasPaymentProblem(a, { relayUrl = RELAY_URL, maxMicroUSD = 0, chainId = 0, relayFetchFn = fetch, quotePath = '/quote?claim=1', what = 'refund' } = {}) {
+  const auth = a.authorization ?? {}
+  const m = a.sign?.message ?? {}
+  const lower = (x) => String(x ?? '').toLowerCase()
+  if (a.sign?.primaryType !== 'TransferWithAuthorization') return 'what it asks this key to sign is not a USDC gas payment'
+  for (const k of ['from', 'to', 'value', 'validAfter', 'validBefore', 'nonce']) if (lower(m[k]) !== lower(auth[k])) return `what it asks this key to sign differs from the payment it describes (${k})`
+  const on = Number(a.sign?.domain?.chainId)
+  if (chainId && on !== chainId) return `the payment is on chain ${a.sign?.domain?.chainId}, not this client's (${chainId})`
+  const token = USDC_ON[on]
+  if (!token) return `the payment is on chain ${a.sign?.domain?.chainId}, where this client knows no USDC`
+  if (lower(a.sign.domain.verifyingContract) !== token) return `the payment is in ${a.sign.domain.verifyingContract}, not USDC`
+  const value = Number(auth.value)
+  if (!Number.isSafeInteger(value) || value <= 0 || value !== Number(a.gasMicroUSD)) return `the payment is ${auth.value}, not the ${a.gasMicroUSD} it quotes`
+  if (!(value < Number(a.leftMicroUSD ?? a.returnedMicroUSD))) return `the gas, ${value}, is not less than the ${a.leftMicroUSD ?? a.returnedMicroUSD} it would return`
+  if (maxMicroUSD && value > maxMicroUSD) return `the gas, ${value}, is over PASS_MAX_SPEND (${maxMicroUSD})`
+  let health, quote
+  try {
+    health = await (await relayFetchFn(`${relayUrl}/health`, { signal: AbortSignal.timeout(10_000) })).json()
+    quote = await (await relayFetchFn(`${relayUrl}${quotePath}`, { signal: AbortSignal.timeout(10_000) })).json()
+  } catch (e) { return `the relay at ${relayUrl} could not be asked what this ${what}'s gas costs (${e?.message ?? e})` }
+  if (!health?.sender || lower(auth.to) !== lower(health.sender)) return `the payment goes to ${auth.to}, not to the relay's gas wallet (${health?.sender ?? 'unknown'} at ${relayUrl})`
+  const priced = Number(quote?.quoteMicroUSD)
+  if (!(priced > 0)) return `the relay at ${relayUrl} gave no price for this ${what}'s gas`
+  if (value > priced * QUOTE_ROOM) return `the gas, ${value}, is more than ${QUOTE_ROOM} times what the relay prices it at now (${priced})`
+  return null
+}
+
+export async function passRefund({ url, channelId, signer, payer = signer, selfSend = false, relayUrl = RELAY_URL, maxMicroUSD = 0, budget = null, chainId = 0, fetchFn = fetch, relayFetchFn = fetchFn, now = Date.now, wait = sleep, tries = 6, log = () => {} }) {
   const ask = (extra) => askPassRefund({ url, channelId, signer, extra, fetchFn, now })
   const first = selfSend ? { selfSend: true } : {}
   let a
@@ -136,8 +205,11 @@ export async function passRefund({ url, channelId, signer, payer = signer, selfS
   if (!payer?.signTypedData || String(payer.address ?? '').toLowerCase() !== from) {
     return { ...a, op: 'refund_failed', code: 'gas_payment_needed', why: `${a.why ?? ''} The gas payment must be signed by the channel's payer, ${a.authorization.from}; this key cannot. Run --refund with the payer's key, or --self-send.`.trim() }
   }
+  const problem = (await gasPaymentProblem(a, { relayUrl, maxMicroUSD, chainId, relayFetchFn })) ?? (budget && !budget.allows(Number(a.gasMicroUSD)) ? `the gas, ${a.gasMicroUSD}, and what this run has already paid would pass PASS_MAX_SPEND (${maxMicroUSD})` : null)
+  if (problem) return { ...a, op: 'refund_failed', code: 'gas_payment_refused', why: `Nothing was signed: ${problem}. Run --refund --self-send to take a signed refund of the full balance and send it at your own gas.` }
   log(`the channel's fees do not cover the refund's gas: paying exactly ${a.gasMicroUSD} micro-USD of it in USDC from ${a.authorization.from}, to get ${a.returnedMicroUSD} back`)
   const signature = await payer.signTypedData(a.sign)
+  budget?.spend(Number(a.gasMicroUSD))
   return ask({ gasPayment: { authorization: a.authorization, signature } })
 }
 
@@ -155,14 +227,47 @@ export async function rebaseChannel(storage, channelId, cs) {
   return true
 }
 
-export async function channelOnChain(pub, channelId) {
-  const [balance, totalClaimed] = await pub.readContract({ address: BATCH_SETTLEMENT_ADDRESS, abi: CHANNELS_ABI, functionName: 'channels', args: [channelId] })
+export async function channelOnChain(pub, channelId, blockNumber = null) {
+  const [balance, totalClaimed] = await pub.readContract({ address: BATCH_SETTLEMENT_ADDRESS, abi: CHANNELS_ABI, functionName: 'channels', args: [channelId], ...(blockNumber !== null ? { blockNumber: BigInt(blockNumber) } : {}) })
   return { channelId: String(channelId).toLowerCase(), balance: String(balance), totalClaimed: String(totalClaimed), chargedCumulativeAmount: String(totalClaimed) }
 }
 
-export async function sendSignedRefund({ answer, account, pub, wallet, storage, channelId, log = () => {} }) {
+const CONFIG = { name: 'config', type: 'tuple', components: [{ name: 'payer', type: 'address' }, { name: 'payerAuthorizer', type: 'address' }, { name: 'receiver', type: 'address' }, { name: 'receiverAuthorizer', type: 'address' }, { name: 'token', type: 'address' }, { name: 'withdrawDelay', type: 'uint40' }, { name: 'salt', type: 'bytes32' }] }
+const VOUCHER_CLAIMS = { name: 'voucherClaims', type: 'tuple[]', components: [{ name: 'voucher', type: 'tuple', components: [{ ...CONFIG, name: 'channel' }, { name: 'maxClaimableAmount', type: 'uint128' }] }, { name: 'signature', type: 'bytes' }, { name: 'totalClaimed', type: 'uint128' }] }
+const SIGNED_REFUND_ABI = [
+  { type: 'function', name: 'refundWithSignature', stateMutability: 'nonpayable', inputs: [CONFIG, { name: 'amount', type: 'uint128' }, { name: 'nonce', type: 'uint256' }, { name: 'receiverAuthorizerSignature', type: 'bytes' }], outputs: [] },
+  { type: 'function', name: 'claimWithSignature', stateMutability: 'nonpayable', inputs: [VOUCHER_CLAIMS, { name: 'authorizerSignature', type: 'bytes' }], outputs: [] },
+  { type: 'function', name: 'multicall', stateMutability: 'nonpayable', inputs: [{ name: 'data', type: 'bytes[]' }], outputs: [{ name: 'results', type: 'bytes[]' }] },
+]
+
+export function signedRefundProblem(tx, { channelId, chainId }) {
+  const lower = (x) => String(x ?? '').toLowerCase()
+  if (!chainId) return 'this client does not know which chain it is on'
+  if (lower(tx.to) !== lower(BATCH_SETTLEMENT_ADDRESS)) return `it calls ${tx.to}, not the escrow (${BATCH_SETTLEMENT_ADDRESS})`
+  if (tx.chainId !== undefined && Number(tx.chainId) !== chainId) return `it is for chain ${tx.chainId}, not this client's (${chainId})`
+  if (tx.value !== undefined && String(tx.value) !== '0' && lower(tx.value) !== '0x0') return `it sends ${tx.value} wei, and a refund sends none`
+  try {
+    const top = decodeFunctionData({ abi: SIGNED_REFUND_ABI, data: tx.data })
+    const calls = top.functionName === 'multicall' ? top.args[0].map((data) => decodeFunctionData({ abi: SIGNED_REFUND_ABI, data })) : [top]
+    let refunds = 0
+    for (const c of calls) {
+      if (c.functionName === 'claimWithSignature') continue
+      if (c.functionName !== 'refundWithSignature') return 'its data is not a signed refund on the escrow'
+      if (lower(computeChannelId(c.args[0], chainId)) !== lower(channelId)) return 'it refunds another channel, not this one'
+      refunds++
+    }
+    return refunds === 1 ? null : `it carries ${refunds} refunds of this channel, not one`
+  } catch { return 'its data is not a signed refund on the escrow' }
+}
+
+export async function sendSignedRefund({ answer, account, pub, wallet, storage, channelId, chainId = wallet?.chain?.id ?? pub?.chain?.id, log = () => {} }) {
   const tx = answer?.transaction
   if (answer?.op !== 'refund_signed' || !tx?.to || !tx?.data) return answer
+  const problem = signedRefundProblem(tx, { channelId, chainId })
+  if (problem) {
+    const { transaction, ...rest } = answer
+    return { ...rest, op: 'refund_failed', code: 'signed_refund_refused', refusedTransaction: transaction, why: `Nothing was sent: the transaction the seller handed back is not a signed refund of this channel (${problem}). Do not send it from any wallet.` }
+  }
   let gas, price, have
   try {
     gas = await pub.estimateGas({ account: account.address, to: tx.to, data: tx.data })
@@ -176,12 +281,17 @@ export async function sendSignedRefund({ answer, account, pub, wallet, storage, 
   }
   const hash = await wallet.sendTransaction({ to: getAddress(tx.to), data: tx.data, value: 0n })
   const receipt = await pub.waitForTransactionReceipt({ hash })
-  log(`sent the signed refund at your own gas: ${receipt.status} ${hash}`)
-  if (receipt.status !== 'success') return { op: 'refund_failed', code: 'reverted', microUSD: answer.microUSD, transaction: hash, gasPaidBy: 'you', why: 'the refund transaction reverted' }
+  const paid = gasWeiOf(receipt)
+  log(`sent the signed refund at your own gas: ${receipt.status} ${hash}${paid ? `; ${paid} wei of ETH` : ''}`)
+  if (receipt.status !== 'success') return { op: 'refund_failed', code: 'reverted', microUSD: answer.microUSD, transaction: hash, gasPaidBy: 'you', ...(paid ? { gasWei: paid } : {}), why: 'the refund transaction reverted' }
   let channelState = null
   try {
-    channelState = await channelOnChain(pub, channelId)
+    channelState = await channelOnChain(pub, channelId, receipt.blockNumber ?? null).catch(() => channelOnChain(pub, channelId))
     await rebaseChannel(storage, channelId, channelState)
   } catch (e) { log(`could not rebase the channel after the refund: ${e?.shortMessage ?? e?.message}`) }
-  return { op: 'refunded', microUSD: answer.microUSD, returnedMicroUSD: answer.microUSD, transaction: hash, gasPaidBy: 'you', ...(channelState ? { channelState } : {}) }
+  return { op: 'refunded', microUSD: answer.microUSD, returnedMicroUSD: answer.microUSD, transaction: hash, gasPaidBy: 'you', ...(paid ? { gasWei: paid } : {}), ...(channelState ? { channelState } : {}) }
+}
+
+export const gasWeiOf = (receipt) => {
+  try { return receipt?.gasUsed !== undefined && receipt?.effectiveGasPrice !== undefined ? String(BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice)) : null } catch { return null }
 }

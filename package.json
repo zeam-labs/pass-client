@@ -1,9 +1,10 @@
 {
-  "name": "@zeam-labs/x402-mcp-bridge",
-  "version": "3.2.0",
-  "description": "Put a wallet in front of any x402-paid MCP server: pay per call, or buy time and ride a ZEAM :: Pass line. Stock MCP clients cannot construct x402 payments; this one does, and proxies your existing client through it.",
+  "name": "@zeampass/client",
+  "version": "4.0.0",
+  "description": "The ZEAM :: Pass client puts a wallet in front of a paid MCP server or URL. Over MCP it pays x402 per call, or line time on a ZEAM :: Bridge seller, and, with a session escrow pinned, an MPP session. Over HTTP its paid_fetch tool pays a 402 as an x402 exact payment, as an MPP charge (method evm, on Base) or from an x402 batch-settlement channel. Formerly @zeam-labs/x402-mcp-bridge.",
   "keywords": [
     "x402",
+    "mpp",
     "mcp",
     "model-context-protocol",
     "mcp-client",
@@ -21,6 +22,7 @@
   "author": "ZEAM Labs, LLC <info@zeamlabs.com> (https://www.zeamlabs.com)",
   "type": "module",
   "bin": {
+    "zeam-pass": "index.mjs",
     "x402-mcp-bridge": "index.mjs"
   },
   "main": "index.mjs",
@@ -31,25 +33,31 @@
   "files": [
     "README.md",
     "LICENSE",
+    "NOTICE",
     "CHANGELOG.md",
+    "agent.mjs",
     "client.mjs",
+    "env.mjs",
     "ethers.mjs",
     "fetch.mjs",
     "index.mjs",
     "line.mjs",
+    "mpp.mjs",
     "pay.mjs",
     "refund.mjs",
+    "session.mjs",
     "viem.mjs"
   ],
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "@x402/evm": "2.22.0",
     "@x402/fetch": "2.22.0",
     "@x402/mcp": "2.22.0",
+    "undici": "6.29.0",
     "viem": "2.55.16"
   },
   "repository": {
