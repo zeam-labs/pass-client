@@ -1,7 +1,5 @@
 # ZEAM :: Pass client
 
-[![ZEAM Prism MCP connector – tool definition quality and endpoint health on Glama](https://glama.ai/mcp/connectors/com.zeamprism/prism-mcp/badges/score.svg)](https://glama.ai/mcp/connectors/com.zeamprism/prism-mcp)
-
 `@zeampass/client`, version 4.0.0. Source: https://github.com/zeam-labs/x402-mcp-bridge
 
 The Pass client is for an agent that carries its own wallet: it stands in front of a paid MCP server or URL and pays
