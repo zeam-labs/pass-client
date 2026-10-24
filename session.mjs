@@ -221,8 +221,9 @@ const MANAGES = new Set(['topUp', 'close'])
 const refusalOf = (answer) => {
   if (!answer || answer.ok) return null
   const b = answer.body
+  const raw = answer.problem?.detail === undefined && !(b && typeof b === 'object')
   const told = answer.problem?.detail ?? (b && typeof b === 'object' ? b.detail ?? b.message ?? b.error : b)
-  return typeof told === 'string' && told.trim() !== '' ? told.trim().slice(0, 600) : null
+  return typeof told === 'string' && told.trim() !== '' ? (raw ? told.trim().slice(0, 600) : told.trim()) : null
 }
 
 export function httpTransport({ fetchFn, url, method = 'POST', headers = {}, body, signal, network }) {
@@ -480,6 +481,7 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
     if (!same(token, offer.currency)) throw new SessionRefusal('session_escrow_refused', `Nothing was signed: the escrow ${offer.escrow} holds ${token}, and the challenge asks for ${offer.currency}.`)
     const config = { payer, payee: offer.recipient, token: offer.currency, authorizedSigner: zeroAddress, escrow: offer.escrow, chainId }
     let n = seat.store.all().filter((r) => same(r.escrow, offer.escrow) && same(r.payee, offer.recipient) && same(r.token, offer.currency) && same(r.payer, payer)).length
+    const proven = (await splitProven(facts.receiver, facts)) ?? (await splitProven(facts.receiver, split))
     let salt, channelId
     for (;;) {
       salt = saltAt(baseSalt, n)
@@ -488,13 +490,12 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
         const c = await chainOf({ escrow: offer.escrow, channelId })
         if (!c.exists) break
         if (!c.finalized) {
-          seat.store.put({ version: 1, channelId, ...config, salt, origin, resource, deposit: String(c.deposit), signed: String(c.settled), spent: String(c.settled), graceSecs: grace, seller: { receiver: facts.receiver, signer: facts.signer, split: null, salt: null, verified: check.verified }, recovered: true, openedAt: null })
-          log(`session: found channel ${channelId} of this key on the escrow, holding ${c.deposit - c.settled}, that ${seat.store.at} has no record of. It is not paid from; --refund closes it.`)
+          seat.store.put({ version: 1, channelId, ...config, salt, origin, resource, deposit: String(c.deposit), signed: String(c.settled), spent: String(c.settled), graceSecs: grace, seller: { receiver: facts.receiver, signer: facts.signer, split: proven?.split ?? null, salt: proven?.salt ?? null, verified: check.verified }, recovered: true, openedAt: null })
+          log(`session: found channel ${channelId} of this key on the escrow, holding ${c.deposit - c.settled}, that ${seat.store.at} has no record of. It is not paid from; ${c.closeRequestedAt > 0 ? 'a close request is on chain, and --refund finishes leaving it without paying the seller for a close' : '--refund closes it'}.`)
         }
       }
       n += 1
     }
-    const proven = (await splitProven(facts.receiver, facts)) ?? (await splitProven(facts.receiver, split))
     if (check.verified === null) once(`session: the payee ${offer.recipient} could not be checked against the seller's split and signer: ${check.why}`)
     if (!proven) once(`session: the seller publishes no split for ${facts.receiver ?? offer.recipient}: leaving without the seller through the relay will need PASS_SESSION_SPLIT, or requestClose and withdraw at this key's own gas (--refund --self-send)`)
     return { version: 1, channelId, ...config, salt, origin, resource, deposit: '0', signed: '0', spent: '0', graceSecs: grace, relay: relayUrl, seller: { receiver: facts.receiver, signer: facts.signer, split: proven?.split ?? null, salt: proven?.salt ?? null, verified: check.verified, ...(check.verified === null ? { why: check.why } : {}), ...(check.factory ? { factory: check.factory } : {}) }, openedAt: new Date(now()).toISOString() }
@@ -740,7 +741,10 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
               : !UINT.test(String(a.validBefore)) || Number(a.validBefore) <= secs || Number(a.validBefore) > secs + GAS_PAYMENT_MAX_SECS ? `the gas payment would stay valid until ${a.validBefore}, more than ${GAS_PAYMENT_MAX_SECS}s from now`
                 : covers?.covered === true ? 'the relay says this channel\'s fees cover the gas of its close, so no gas is owed'
                   : (await gasPaymentProblem({ ...q, leftMicroUSD: Number(left), returnedMicroUSD: Number(left) }, { relayUrl: r.relay ?? relayUrl, maxMicroUSD, chainId, relayFetchFn: relayFetch, quotePath: '/quote?session=close', what: 'close' })) ?? gasOver(r, BigInt(a.value))
-        if (why) return { op: 'session_close_failed', channelId, code: 'gas_payment_refused', gasMicroUSD: q.gasMicroUSD, leftMicroUSD: q.leftMicroUSD, why: `The seller asked for the close's gas in USDC and it was refused: ${why}. ${last}` }
+        if (why) {
+          const { leftMicroUSD, returnedMicroUSD, gasMicroUSD } = q
+          return { op: 'session_close_failed', channelId, code: GAS_PAYMENT_NEEDED, ...(leftMicroUSD !== undefined ? { leftMicroUSD } : {}), ...(returnedMicroUSD !== undefined ? { returnedMicroUSD } : {}), ...(gasMicroUSD !== undefined ? { gasMicroUSD } : {}), why: refusalOf(told.answer) ?? 'the seller asked for the close\'s gas in USDC', refused: 'gas_payment_refused', refusedWhy: `The seller asked for the close's gas in USDC and it was refused: ${why}. ${last}` }
+        }
         log(`session: the fees of channel ${r.channelId} do not cover the gas of its close: paying ${a.value} of it in USDC from what comes back, ${left}; no ETH is needed`)
         gasSigned = a
         payload.gasPayment = { authorization: a, signature: await signer.signTypedData(q.sign) }
@@ -764,7 +768,7 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
     }, failed)
   }
 
-  const exit = ({ dir, channelId, selfSend = false, wallet = null }) => {
+  const exit = ({ dir, channelId, selfSend = false, wallet = null, freeOnly = false }) => {
     const seat = seatFor(dir)
     const failed = (e) => ({ op: 'session_exit_failed', channelId, code: 'failed', why: said(e) })
     return guarded(seat, async () => {
@@ -781,7 +785,7 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
       const grace = Number(r.graceSecs ?? await read(r.escrow, escrowAbi, 'CLOSE_GRACE_PERIOD'))
       const leg = c.closeRequestedAt === 0 ? 'requestClose' : at >= c.closeRequestedAt + grace ? 'withdraw' : null
       const readyAt = (from) => new Date((from + grace) * 1000).toISOString()
-      if (!leg) return { op: 'session_exit_waiting', channelId, readyAt: readyAt(c.closeRequestedAt), secondsLeft: c.closeRequestedAt + grace - at, why: 'the close request is on chain; the withdrawal can be sent when the grace period has passed' }
+      if (!leg) return { op: 'session_exit_waiting', channelId, readyAt: readyAt(c.closeRequestedAt), secondsLeft: c.closeRequestedAt + grace - at, why: `the close request is on chain; the withdrawal can be sent when the grace period has passed${freeOnly ? ', and no close is sent to the seller meanwhile' : ''}` }
       let hash
       let held = null
       let paying = null
@@ -828,6 +832,7 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
           if (!hash && (j?.results?.[0]?.code ?? j?.code) === GAS_PAYMENT_NEEDED && usdc(r)) {
             let quote
             const refusal = String(j?.results?.find((x) => x?.error)?.error ?? j?.error ?? '').slice(0, 200)
+            if (freeOnly) return { op: 'session_exit_waiting', channelId, code: GAS_PAYMENT_NEEDED, readyAt: readyAt(c.closeRequestedAt), secondsLeft: 0, why: `a close request is on chain and its grace period has passed, and the relay sends the withdrawal only with its gas paid (${refusal}). Nothing was signed for it, and no close was sent to the seller: --refund --exit pays that gas in USDC out of what returns, --refund --self-send sends withdraw from this key at its own gas.` }
             const live = await livePayment(r, at)
             if (live) return { op: 'session_exit_failed', channelId, code: GAS_PAYMENT_PENDING, gasMicroUSD: Number(live.gas), until: new Date(Number(live.until) * 1000).toISOString(), why: `the relay did not send ${EXIT[leg].relayed} (${refusal}), and ${pendingWhy(live)}. --refund --self-send sends ${leg} from this key at its own gas.` }
             quote = await relayCovers(r, { call, payment: true })
@@ -887,10 +892,13 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
     }, failed)
   }
 
-  const leave = async ({ dir, transportFor, forced = false, selfSend = false, wallet = null }) => {
+  const leave = async ({ dir, origin = null, transportFor, forced = false, selfSend = false, wallet = null }) => {
     const out = []
-    for (const r of seatFor(dir).store.open().filter((x) => same(x.payer, payer) && x.chainId === chainId)) {
+    for (const r of seatFor(dir).store.open().filter((x) => same(x.payer, payer) && x.chainId === chainId && (!origin || x.origin === origin))) {
       if (forced || selfSend || r.exit) { out.push(await exit({ dir, channelId: r.channelId, selfSend, wallet })); continue }
+      let requested = false
+      try { const c = await chainOf(r); requested = c.exists && !c.finalized && c.closeRequestedAt > 0 } catch {}
+      if (requested) { out.push(await exit({ dir, channelId: r.channelId, freeOnly: true })); continue }
       const t = await transportFor(r)
       out.push(t ? await close({ dir, channelId: r.channelId, fresh: t.fresh, send: t.send }) : { op: 'session_close_failed', channelId: r.channelId, code: 'no_route', why: 'the record names no route to ask the seller on' })
     }

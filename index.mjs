@@ -12,7 +12,7 @@ import { FileClientChannelStorage } from '@x402/evm/batch-settlement/client/file
 import { computeChannelId, buildChannelConfig } from '@x402/evm/batch-settlement/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import { createPublicClient, createWalletClient, http, fallback, keccak256, toHex, getAddress } from 'viem'
-import { passRefund, rebaseChannel, sendSignedRefund, refundUrlBeside, refundUrlInTerms, readSeller, rememberRefundUrl, hearingMcp, withGrant } from './refund.mjs'
+import { passRefund, rebaseChannel, sendSignedRefund, refundUrlBeside, refundUrlInTerms, readSeller, rememberRefundUrl, rememberPayingChannel, channelsElsewhere, sellerOf, hearingMcp, withGrant, channelOnChain, voucherSigner, withdrawable } from './refund.mjs'
 import { LINE_META, PRICE_META, LINE_GONE, lineUrlOf, lineUrlBeside, timeOf, timeFromTerms, isTimeTag, bodyOf, codeOf, meterOf, timeTerms, buyFor, askedMicro, MIN_BUY_MS, openLine, lineOp, marginFor, slowestFor, keepAhead } from './line.mjs'
 import { FETCH_TOOL, isFetchTool, makeFetchTool } from './fetch.mjs'
 import { makeSessions, sessionTrust, splitHint, httpTransport, mcpTransport, SESSION_MODES } from './session.mjs'
@@ -67,6 +67,7 @@ if (has('--help') || has('-h')) {
     '  --refund            the seller sends back the unspent balance and the unburned line time.',
     '  --refund --self-send  a signed refund, sent from this key at its own gas.',
     '  --refund --exit     leave an MPP session channel without the seller: the close request, then after the grace period the withdrawal.',
+    '  --refund --channel <id>  ask for that channel by name: the seller refunds it only to a proof signed by its payer.',
     '',
   ].join('\n'))
   process.exit(0)
@@ -121,18 +122,34 @@ const blockedBy = (why, needed = null) => {
   capWhy = { message: why, ...(needed !== null ? { needed: String(needed) } : {}) }
   throw new Error(why)
 }
+const forCall = new AsyncLocalStorage()
+let callEnded = false
 const selector = selectorFor(WANT, (a) => {
   chosenAccept = a
+  const running = forCall.getStore()
+  if (running && !running()) { callEnded = true; throw new Error('the call this line time was for has ended. Nothing was signed.') }
+  if (leaving) throw new Error('the Pass client is exiting. Nothing was signed.')
   if (!overCap(a?.amount, a?.scheme === PREFERRED)) return
   blockedBy(`this payment of ${a.amount} would pass PASS_MAX_SPEND. Nothing was signed.`)
 }, log)
 
 const storage = new FileClientChannelStorage({ directory: stateDir })
 let channelId = null
+let channelGuessed = false
+let heldBefore = null
+const payingKey = () => `${String((cardSigner ?? account)?.address ?? '').toLowerCase()} ${EFFECTIVE_SALT}`
 const watchedStorage = {
   get: (k) => storage.get(k),
   delete: (k) => storage.delete(k),
-  set: async (k, ctx) => { channelId = k; noteBilled(await storage.get(k).catch(() => undefined), ctx); return storage.set(k, ctx) },
+  set: async (k, ctx) => {
+    channelId = k
+    channelGuessed = false
+    rememberPayingChannel(stateDir, UPSTREAM, payingKey(), String(k).toLowerCase())
+    const prev = await storage.get(k).catch(() => undefined)
+    if (heldBefore && !heldBefore.has(k)) heldBefore.set(k, BigInt(prev?.balance ?? 0))
+    noteBilled(prev, ctx)
+    return storage.set(k, ctx)
+  },
 }
 
 const depositPolicy = { depositMultiplier: Number(setting('DEPOSIT_MULTIPLIER') ?? 40) }
@@ -325,14 +342,14 @@ const sessionRoute = (r) => {
 }
 const termsURL = new URL('/.well-known/x402', UPSTREAM).toString()
 
-const seller = { time: null, lineUrl: null, refund: readSeller(stateDir).refund ?? null, tags: null }
+const seller = { time: null, lineUrl: null, refund: readSeller(stateDir, UPSTREAM).refund, tags: null }
 const learnTerms = (t) => {
   if (!t || typeof t !== 'object') return
   learnFloor(floor, t)
   seller.time ??= timeFromTerms(t)
   seller.lineUrl ??= lineUrlOf(t)
   const r = refundUrlInTerms(t)
-  if (r && !seller.refund) { seller.refund = r; rememberRefundUrl(stateDir, r) }
+  if (r && !seller.refund) { seller.refund = r; rememberRefundUrl(stateDir, UPSTREAM, r) }
 }
 
 let accepts = null
@@ -375,31 +392,96 @@ const channelForThisSalt = () => {
   const reqs = selectorFor(WANT)(accepts.x402Version, accepts.accepts)
   return reqs ? saltChannel(reqs) : null
 }
-const channelFiles = () => { try { return readdirSync(join(stateDir, 'client')).filter((n) => n.toLowerCase().endsWith('.json')) } catch { return [] } }
+const allChannelFiles = () => { try { return readdirSync(join(stateDir, 'client')).filter((n) => n.toLowerCase().endsWith('.json')) } catch { return [] } }
+const ELSEWHERE = KEYLESS ? new Set() : channelsElsewhere(stateDir, UPSTREAM)
+const channelFiles = () => allChannelFiles().filter((n) => !ELSEWHERE.has(n.replace(/\.json$/i, '').toLowerCase()))
 const SALT_CHANNEL = channelForThisSalt()
+const PAID_CHANNEL = KEYLESS ? null : readSeller(stateDir, UPSTREAM).paying[payingKey()] ?? null
+const paidFile = typeof PAID_CHANNEL === 'string' ? allChannelFiles().find((n) => n.toLowerCase() === `${PAID_CHANNEL.toLowerCase()}.json`) : null
 if (SALT_CHANNEL) {
-  if (channelFiles().some((n) => n.toLowerCase() === `${SALT_CHANNEL}.json`)) channelId = SALT_CHANNEL
+  if (allChannelFiles().some((n) => n.toLowerCase() === `${SALT_CHANNEL}.json`)) channelId = SALT_CHANNEL
+} else if (paidFile) {
+  channelId = paidFile.replace(/\.json$/i, '')
 } else {
   const f = channelFiles()[0]
-  if (f) channelId = f.replace(/\.json$/i, '')
+  if (f) { channelId = f.replace(/\.json$/i, ''); channelGuessed = true }
+}
+
+const derivedChannel = async () => {
+  if (KEYLESS) return null
+  let id = SALT_CHANNEL
+  if (!id) {
+    const probe = untilAnswered(new Client({ name: NAME, version: VERSION }), { signal: () => AbortSignal.timeout(30_000) })
+    try {
+      await probe.connect(new StreamableHTTPClientTransport(new URL(UPSTREAM), { fetch: hearingMcp(net, (u) => { seller.refund = u; rememberRefundUrl(stateDir, UPSTREAM, u) }, learnTerms) }))
+      const tools = (await probe.listTools()).tools ?? []
+      const tagged = tools.filter((t) => t._meta?.[PRICE_META])
+      const paid = tagged.length ? tagged.filter((t) => !t._meta[PRICE_META].free) : tools
+      const pick = paid.find((t) => t.name === 'buy_time') ?? paid[0]
+      const time = pick?.name === 'buy_time' ? timeOf(pick._meta?.[PRICE_META]) : null
+      const out = pick ? await probe.callTool({ name: pick.name, arguments: time ? buyFor({ wantMs: 2000, time }).args : {} }) : null
+      const b = bodyOf(out)
+      const reqs = Array.isArray(b?.accepts) && b.accepts.length ? selectorFor(WANT)(b.x402Version ?? 1, b.accepts) : null
+      id = reqs ? saltChannel(reqs) : null
+    } catch { id = null } finally { await probe.close().catch(() => {}) }
+  }
+  if (!id) return null
+  const w = await withdrawable(pub, storage, id)
+  return w.balance > 0n ? w : null
+}
+
+const elsewhere = () => {
+  const away = allChannelFiles().length - channelFiles().length
+  const other = channelFiles().length
+  return `${away ? `; ${stateDir} holds ${away} channel(s) paid at other sellers, refunded with --refund and that seller's PASS_MCP_URL` : ''}${other ? `; it holds ${other} channel(s) no run recorded here for this key and PASS_SALT, refunded with --refund and the key and PASS_SALT that paid them, or with --refund --channel <id>` : ''}`
 }
 
 if (has('--refund')) {
   const selfSend = has('--self-send')
-  const left = sessions ? await sessions.leave({ dir: stateDir, transportFor: sessionRoute, forced: has('--exit'), selfSend,
+  const named = flag('--channel')
+  if (named !== null && !/^0x[0-9a-fA-F]{64}$/.test(named)) {
+    process.stderr.write(`--channel takes a channel id, 0x and 64 hex digits; "${named}" is not one. Nothing was asked.\n`)
+    process.exit(2)
+  }
+  const left = sessions ? await sessions.leave({ dir: stateDir, origin: sellerOf(UPSTREAM), transportFor: sessionRoute, forced: has('--exit'), selfSend,
     wallet: selfSend ? createWalletClient({ account, chain, transport: http(setting('RPC_URL') ?? chain.rpcUrls.default.http[0]) }) : null }) : []
   for (const a of left) {
     process.stdout.write(JSON.stringify(a, null, 2) + '\n')
     if (a.op === 'session_closed') log(`session channel ${a.channelId}: ${a.returned} returned, ${a.settled} paid to the seller${a.gas ? `; ${a.gas} of what returned paid the gas, in USDC` : ''}`)
     else if (a.op === 'session_exit_requested' && a.withdrawal) log(`session channel ${a.channelId}: close requested without the seller; the relay sends the withdrawal after ${a.readyAt ?? `the grace period (${a.graceSecs}s from the request's block)`} and takes ${a.gasMicroUSD} micro-USD of gas from what returns. Nothing more to send; --refund after that shows it closed${a.note ? `. ${a.note}` : ''}`)
     else if (a.op === 'session_exit_requested') log(`session channel ${a.channelId}: close requested without the seller; run --refund again after ${a.readyAt ?? `the grace period (${a.graceSecs}s from the request's block)`} to withdraw`)
-    else if (a.op === 'session_exit_waiting' && a.withdrawal) log(`session channel ${a.channelId}: ${a.why}`)
+    else if (a.op === 'session_exit_waiting' && (a.withdrawal || a.code)) log(`session channel ${a.channelId}: ${a.why}`)
     else if (a.op === 'session_exit_waiting') log(`session channel ${a.channelId}: the withdrawal can be sent after ${a.readyAt}; run --refund again then`)
-    else log(`session channel ${a.channelId}: ${a.why}${a.op === 'session_close_failed' ? ' --refund --exit leaves without the seller: a close request through the relay, then the withdrawal after the grace period.' : ''}`)
+    else log(`session channel ${a.channelId}: ${a.refusedWhy ? `the seller answered ${a.code} (${a.why}). ${a.refusedWhy}` : a.why}${a.op === 'session_close_failed' ? ' --refund --exit leaves without the seller: a close request through the relay, then the withdrawal after the grace period.' : ''}`)
   }
   const sessionsLeft = left.some((a) => a.op !== 'session_closed')
-  if (!channelId) {
-    if (!left.length) { process.stderr.write('no channel to refund — nothing has been bought with this key and salt\n'); process.exit(2) }
+  if (named) {
+    const id = named.toLowerCase()
+    const signer = await voucherSigner(await storage.get(id).catch(() => undefined), id, chainId)
+    if (signer && signer !== account.address.toLowerCase()) {
+      process.stderr.write(`${id} is not asked for: its voucher in ${stateDir} was signed by ${signer}, and this key, ${account.address}, cannot sign for it\n`)
+      process.exit(2)
+    }
+    channelId = id
+    channelGuessed = false
+    log(`asking for ${id}, named with --channel: the seller refunds it only to a proof signed by its payer`)
+  } else if (!channelId || channelGuessed) {
+    const d = await derivedChannel()
+    if (d && d.withdrawable > 0n) {
+      channelId = d.id
+      channelGuessed = false
+      rememberPayingChannel(stateDir, UPSTREAM, payingKey(), d.id)
+      log(`no run from ${stateDir} recorded the channel this key and PASS_SALT pay at ${sellerOf(UPSTREAM)}; the seller's terms give it as ${d.id}, from which the payer can withdraw ${d.withdrawable} (balance ${d.balance}, ${d.owed} claimed by or owed to the seller): asking for it`)
+    } else if (d) {
+      process.stderr.write(`nothing to refund at ${sellerOf(UPSTREAM)}: the channel this key and PASS_SALT pay there, ${d.id}, worked out from the seller's terms, holds nothing the payer can withdraw (balance ${d.balance}, ${d.owed} claimed by or owed to the seller). Nothing was asked${elsewhere()}\n`)
+      process.exit(left.length ? (sessionsLeft ? 1 : 0) : 2)
+    }
+  }
+  if (!channelId || channelGuessed) {
+    if (!left.length) {
+      process.stderr.write(`no channel to refund at ${sellerOf(UPSTREAM)} — nothing has been bought there with this key and salt${elsewhere()}\n`)
+      process.exit(2)
+    }
     process.exit(sessionsLeft ? 1 : 0)
   }
   if (!seller.refund) {
@@ -464,7 +546,7 @@ const callFree = (name, args) => whole(() => upstream.callTool(name, args))
 const callPaid = (name, args, payload) => whole(() => upstream.callToolWithPayment(name, args, payload))
 const callOnLineRaw = (name, args, credential) => plain.callTool({ name, arguments: args, _meta: { [LINE_META]: credential } })
 
-const hearing = hearingMcp(net, (u) => { seller.refund = u; rememberRefundUrl(stateDir, u) }, learnTerms)
+const hearing = hearingMcp(net, (u) => { seller.refund = u; rememberRefundUrl(stateDir, UPSTREAM, u) }, learnTerms)
 await upstream.connect(new StreamableHTTPClientTransport(new URL(UPSTREAM), { fetch: hearing }))
 log(KEYLESS ? `catalog from ${UPSTREAM}, paying nothing` : `paying as ${account.address} -> ${UPSTREAM}`)
 
@@ -511,11 +593,26 @@ const needsTopUp = async (terms) => {
   return BigInt(left) < BigInt(row.amount ?? 0)
 }
 
+const PROBE_FRESH_MS = 10_000
+let probed = null
+const probedFor = (name, args) => {
+  const p = probed
+  probed = null
+  if (!p || p.name !== name || p.args !== JSON.stringify(args) || Date.now() - p.at > PROBE_FRESH_MS) return null
+  return upstream.extractPaymentRequiredFromResult?.(p.out) ?? null
+}
+const payFromProbe = async (name, args, required) => callPaid(name, args, await payments.createPaymentPayload(required))
+
+const exitingAnswer = () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
+  error: 'pass_client_exiting', message: 'The Pass client is exiting: this call was not paid for or sent.' }) }] })
+
 const payNow = async (name, args) => {
   if (KEYLESS) return callFree(name, args)
+  if (leaving) return exitingAnswer()
   if (coldStart) {
     coldStart = false
-    const out = await callFree(name, args)
+    const required = probedFor(name, args)
+    const out = required ? await payFromProbe(name, args, required) : await callFree(name, args)
     if (codeOf(out) !== 'funding_requires_open_fee' || !learnFloor(floor, bodyOf(out))) return out
     log(`the seller's deposit floor is ${floor.micro} micro-USD: depositing that`)
     return callFree(name, args)
@@ -530,7 +627,14 @@ const payNow = async (name, args) => {
     terms = timeTerms(accepts, buyMicro)
     funding = true
   }
-  if (!terms) return callFree(name, args)
+  if (!terms) {
+    const required = probedFor(name, args)
+    if (!required) return callFree(name, args)
+    const out = await payFromProbe(name, args, required)
+    if (codeOf(out) !== 'funding_requires_open_fee' || !learnFloor(floor, bodyOf(out))) return out
+    log(`the seller's deposit floor is ${floor.micro} micro-USD: depositing that`)
+    return callFree(name, args)
+  }
   for (const attempt of [1, 2]) {
     try {
       const payload = await payments.createPaymentPayload(terms)
@@ -581,6 +685,8 @@ const AUTO_FAST_RUN = Number(setting('AUTO_FAST_RUN') ?? 2)
 const AUTO_GAP_MS = Number(setting('AUTO_GAP_MS') ?? 10_000)
 const AHEAD_MS = Number(setting('LINE_AHEAD_MS') ?? 2000)
 const IDLE_MS = Number(setting('LINE_IDLE_MS') ?? 1000)
+const EXIT_WAIT_MS = Number(setting('EXIT_WAIT_MS') ?? 30_000)
+let leaving = false
 
 const line = { credential: null, channel: null, msRemaining: 0, readAt: 0, metering: false, opening: null, offTimer: null, buys: 0, riding: 0, calls: 0, keeper: null, slowestBuyMs: 0, slowestDepositMs: 0, depositNext: false, capped: false, release: null }
 const meterReads = (ms) => { line.msRemaining = Number(ms); line.readAt = Date.now() }
@@ -634,15 +740,40 @@ const touch = () => {
   line.offTimer.unref?.()
 }
 
+let firstChannel = SALT_CHANNEL
+const channelPaid = async () => {
+  if (KEYLESS || firstChannel) return firstChannel
+  if (channelId && !channelGuessed) return channelId
+  if (!seller.time) await tagOf('buy_time')
+  if (!seller.time) return null
+  const args = buyFor({ wantMs: AHEAD_MS, time: seller.time }).args
+  const out = await whole(() => plain.callTool({ name: 'buy_time', arguments: args })).catch(() => null)
+  if (out) probed = { name: 'buy_time', args: JSON.stringify(args), out, at: Date.now() }
+  const b = bodyOf(out)
+  const reqs = Array.isArray(b?.accepts) && b.accepts.length ? selectorFor(WANT)(b.x402Version ?? 1, b.accepts) : null
+  firstChannel = reqs ? saltChannel(reqs) : null
+  return firstChannel
+}
+
 const holdLine = () => {
   if (line.credential) return Promise.resolve(true)
   if (line.opening) return line.opening
-  if (!channelId || KEYLESS) return Promise.resolve(false)
+  if (KEYLESS) return Promise.resolve(false)
   line.opening = (async () => {
-    const o = await openLine({ url: lineUrl(), channelId, signer: account, fetchFn: net })
-    if (o.op !== 'opened') { log(`line not opened: ${o.code}${o.why ? ` (${o.why})` : ''}`); return false }
+    const on = channelId && !channelGuessed ? channelId : await channelPaid()
+    if (!on) return false
+    const o = await openLine({ url: lineUrl(), channelId: on, signer: account, fetchFn: net })
+    if (o.op !== 'opened') {
+      log(`line not opened: ${o.code}${o.why ? ` (${o.why})` : ''}`)
+      if (o.code === 'unknown_channel' && on === channelId && !channelGuessed) {
+        log(`the seller does not know ${on}, the channel ${stateDir} last paid with this key and PASS_SALT: asking which channel they pay here`)
+        channelGuessed = true
+        firstChannel = null
+      }
+      return false
+    }
     line.credential = o.credential
-    line.channel = String(channelId).toLowerCase()
+    line.channel = String(on).toLowerCase()
     line.metering = o.metering !== false
     meterReads(o.msRemaining ?? 0)
     log(`line open at ${lineUrl()}: ${line.msRemaining} ms on the meter`)
@@ -659,29 +790,54 @@ const meterOn = async () => {
   return false
 }
 
-const buyTime = async (wantMs, enough = () => false) => {
+const offChannel = () => Boolean(line.credential && line.channel && channelId && !channelGuessed && line.channel !== String(channelId).toLowerCase())
+const moveLine = () => {
+  const from = line.channel
+  const credential = dropLine(`time is bought on ${String(channelId).toLowerCase()}, not on ${from}`)
+  if (!credential) return
+  closing = closing.then(async () => {
+    await lineOp({ url: lineUrl(), op: 'off', credential, fetchFn: net }).catch(() => {})
+    await lineOp({ url: lineUrl(), op: 'close', credential, fetchFn: net }).catch(() => {})
+  })
+}
+
+const buyTime = async (wantMs, enough = () => false, running = null) => {
   if (!seller.time) await tagOf('buy_time')
   if (!seller.time) return false
-  if (line.credential && line.channel && channelId && line.channel !== String(channelId).toLowerCase()) {
-    log(`the line rides ${line.channel} but a purchase would go to ${String(channelId).toLowerCase()}: not buying time against a channel the line does not ride. Keep PASS_STATE_DIR and PASS_SALT steady between runs, or run --refund.`)
-    return false
+  if (offChannel()) {
+    if (line.calls > 0) {
+      log(`the line rides ${line.channel} but a purchase would go to ${String(channelId).toLowerCase()}: not buying time against a channel the line does not ride while a call runs on it`)
+      return false
+    }
+    moveLine()
   }
-  const buy = buyFor({ wantMs, time: seller.time, availableMicro: await available(), depositMultiplier: depositPolicy.depositMultiplier })
+  const buy = buyFor({ wantMs, time: seller.time, availableMicro: channelGuessed ? null : await available(), depositMultiplier: depositPolicy.depositMultiplier })
   let took = 0
   let carried = false
   let skipped = false
+  let idle = false
   const out = await asked.run(null, () => oneAtATime(async () => {
+    if (leaving || (running && !running())) { idle = true; return null }
     if (enough()) { skipped = true; return null }
     const held = await deposited()
+    const heldOn = channelId
+    heldBefore = new Map()
     const from = Date.now()
     try {
-      const o = await payNow('buy_time', buy.args)
+      const o = await forCall.run(running, () => payNow('buy_time', buy.args))
       const r = bodyOf(o)
       if (!o?.isError && Number.isFinite(Number(r?.msRemaining))) meterReads(r.msRemaining)
       return o
-    } finally { took = Date.now() - from; carried = (await deposited()) > held }
+    } finally {
+      took = Date.now() - from
+      const before = heldBefore.get(channelId) ?? (channelId === heldOn ? held : 0n)
+      heldBefore = null
+      carried = (await deposited()) > before
+    }
   }))
+  if (idle) return null
   if (skipped) return true
+  if (offChannel() && line.calls === 0) moveLine()
   const b = bodyOf(out)
   if (out?.isError || !b) { log(`buy_time: ${codeOf(out) ?? reasonFrom(out) ?? 'no answer'}`); return false }
   line.buys += 1
@@ -717,8 +873,10 @@ const topUp = async (wantMs, have) => {
   }
   const blocked = capBlocked
   let why = null
-  const ok = await buyTime(Math.min(wantMs, fits), () => lineLeft() > margin()).catch((e) => { why = e?.message ?? String(e); return false })
+  callEnded = false
+  const ok = await buyTime(Math.min(wantMs, fits), () => lineLeft() > margin(), () => line.calls > 0 && !leaving).catch((e) => { why = e?.message ?? String(e); return false })
   if (capBlocked && !blocked) { capBlocked = blocked; line.capped = true; return null }
+  if (ok === null || callEnded) { callEnded = false; log('no line time bought: the call it was for has ended'); return null }
   if (!ok) log(`could not buy more line time while a call runs${why ? ` (${why})` : ''}: it keeps running on the ${Math.round(Math.max(0, lineLeft()))} ms left`)
   return ok
 }
@@ -742,7 +900,7 @@ const rideLine = async (name, args, needMs = 0) => {
   let want = Math.max(2 * margin(), Math.ceil(needMs * 1.25))
   let need = needMs > 0 ? want : MIN_BUY_MS
   for (let attempt = 0; attempt < 4; attempt++) {
-    if (capReached) break
+    if (capReached || leaving) break
     if (!(await holdLine())) return null
     if (!(await meterOn())) { if (!line.credential) continue; return null }
     const fill = line.msRemaining < need ? want : need
@@ -751,6 +909,7 @@ const rideLine = async (name, args, needMs = 0) => {
       if (!(await buyTime(Math.max(MIN_BUY_MS, want - had), () => line.msRemaining >= fill))) { if (had >= MIN_BUY_MS) break; return null }
       if (line.msRemaining <= had) break
     }
+    if (!line.credential) continue
     const kept = keeping()
     try { out = await callOnLineRaw(name, args, line.credential) } finally { kept() }
     const m = meterOf(out)
@@ -791,11 +950,21 @@ const reasonFrom = (out) => {
   return typeof why === 'string' && why ? why.slice(0, 160) : null
 }
 
+const capFigures = () => ({ spentMicroUSD: spentMicroUSD + fetchSpent, capMicroUSD: MAX_SPEND })
+const notPaid = (name) => log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: ${name} was not paid for`)
+
 const capAnswer = (message = 'This payment would go over the PASS_MAX_SPEND ceiling, so it was not made. ' +
   'Raise it, set PASS_MAX_SPEND=0 to remove it, or restart the Pass client.', more = {}) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
   error: 'x402_bridge_spend_cap_reached',
-  spentMicroUSD: spentMicroUSD + fetchSpent, capMicroUSD: MAX_SPEND,
+  ...capFigures(),
   message, ...more }) }] })
+
+const fetchCapped = (name, out) => {
+  const b = bodyOf(out)
+  if (b?.error !== 'x402_bridge_spend_cap_reached') return out
+  notPaid(name)
+  return { ...out, content: [{ type: 'text', text: JSON.stringify({ ...b, ...capFigures() }) }] }
+}
 
 const UPSTREAM_HOST = new URL(UPSTREAM).host
 const fetchState = (url) => {
@@ -828,7 +997,7 @@ const bySession = (name, args, timed = false) => {
     if (!error) return answer.out
     sessionTools.delete(name)
     if (error === 'x402_bridge_spend_cap_reached') {
-      log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: ${name} was not paid for`)
+      notPaid(name)
       return capAnswer(message)
     }
     log(`session: ${name} was not paid (${error}): ${message}`)
@@ -837,6 +1006,7 @@ const bySession = (name, args, timed = false) => {
 }
 
 const callTool = async (name, args) => {
+  if (leaving) return exitingAnswer()
   capBlocked = false
   capWhy = null
   let out
@@ -846,12 +1016,19 @@ const callTool = async (name, args) => {
     if (!capBlocked) throw e
   }
   if (!capBlocked) return out
-  log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: ${name} was not paid for`)
+  notPaid(name)
   return capWhy ? capAnswer(`${capWhy.message} Raise PASS_MAX_SPEND, set it to 0 to remove it, or restart the Pass client.`, capWhy.needed ? { needed: capWhy.needed } : {}) : capAnswer()
 }
 
+const cutAfterMs = (tag, out) => {
+  const priced = Number(tag?.callMs)
+  if (priced > 0) return priced
+  const said = /needs more than the (\d+) ms its price buys/.exec(String(bodyOf(out)?.message ?? ''))
+  return said ? Number(said[1]) : 0
+}
+
 const callWithin = async (name, args) => {
-  if (isFetchTool(name) && fetchTool) return fetchTool(args, { signal: asked.getStore() ?? undefined })
+  if (isFetchTool(name) && fetchTool) return fetchCapped(name, await fetchTool(args, { signal: asked.getStore() ?? undefined }))
   if (capReached) return capAnswer()
   if (KEYLESS) return callFree(name, args)
   if (name === 'buy_time') {
@@ -870,11 +1047,12 @@ const callWithin = async (name, args) => {
   }
   if (!timed || LINE_MODE === 'off') return payFirst(name, args)
   const worth = riding || fast
-  if (worth && !channelId && LINE_MODE === 'on') {
+  const unopened = worth && LINE_MODE === 'on' && channelId && !channelGuessed && !line.credential ? !(await holdLine()) && !channelGuessed : false
+  if (worth && (!channelId || channelGuessed) && LINE_MODE === 'on' && !(await holdLine())) {
     log(`${name} is sold by time: buying time first, so this call rides a line`)
     await buyTime(AHEAD_MS)
   }
-  if (worth && channelId) {
+  if (worth && (channelId || line.credential) && !unopened) {
     const out = await ride(name, args)
     if (out) return out
   }
@@ -882,7 +1060,8 @@ const callWithin = async (name, args) => {
   const code = codeOf(out)
   if ((code === 'out_of_time' || code === 'line_required') && channelId) {
     log(code === 'out_of_time' ? `${name} needs more than one block: calling it on a line` : 'the seller serves this channel on a line')
-    const again = await ride(name, args, Number(bodyOf(out)?.needsMs) || 0)
+    const left = Number(bodyOf(out)?.needsMs) || 0
+    const again = await ride(name, args, code === 'out_of_time' && left > 0 ? cutAfterMs(tag, out) + left : left)
     if (again) return again
   }
   return out
@@ -900,28 +1079,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 })
 server.setRequestHandler(CallToolRequestSchema, (req, extra) => asked.run(extra?.signal ?? null, () => callTool(req.params.name, req.params.arguments ?? {})))
 
-let leaving = false
-const stopPaying = async (why) => {
-  if (leaving) return
-  leaving = true
-  await Promise.race([letGo(why, { leaving: true }), new Promise((r) => setTimeout(r, 3000))])
-  process.exit(0)
+const within = (p, ms) => {
+  let timer = null
+  return Promise.race([p.then(() => true, () => true), new Promise((r) => { timer = setTimeout(() => r(false), Math.max(0, ms)) })])
+    .finally(() => clearTimeout(timer))
 }
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => stopPaying('shutting down'))
+const purchasesAnswered = async (until) => {
+  for (let q = paymentQueue; ; q = paymentQueue) {
+    if (!(await within(q, until - Date.now()))) return false
+    if (q === paymentQueue) return true
+  }
+}
+let exitCode = 0
+let shuttingDown = null
+const shutdown = (why, code = 0) => {
+  exitCode = Math.max(exitCode, code)
+  if (shuttingDown) return shuttingDown
+  leaving = true
+  line.keeper?.stop()
+  shuttingDown = (async () => {
+    if (!(await purchasesAnswered(Date.now() + EXIT_WAIT_MS))) {
+      log(`a purchase was still unanswered after ${EXIT_WAIT_MS} ms (PASS_EXIT_WAIT_MS): letting the line go without its answer`)
+    }
+    await within(letGo(why, { leaving: true }), 3000)
+    process.exit(exitCode)
+  })()
+  return shuttingDown
+}
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => shutdown(`${sig}: shutting down`))
 for (const ev of ['end', 'close']) {
-  process.stdin.on(ev, () => stopPaying('stdin closed — whatever started us is gone'))
+  process.stdin.on(ev, () => shutdown('stdin closed — whatever started us is gone'))
 }
-process.on('disconnect', () => stopPaying('parent disconnected'))
+process.on('disconnect', () => shutdown('parent disconnected'))
+const failedHard = (e) => {
+  if (!leaving) log(`stopping on an error: ${e?.stack ?? e?.message ?? e}`)
+  shutdown('stopping on an error', 1)
+}
+process.on('uncaughtException', failedHard)
+process.on('unhandledRejection', failedHard)
 
-const finish = async (code) => {
-  leaving = true
-  await Promise.race([oneAtATime(() => letGo('one-shot call finished', { leaving: true })), new Promise((r) => setTimeout(r, 3000))])
-  process.exit(code)
-}
+const finish = (code) => shutdown('one-shot call finished', code)
 
 if (has('--tools')) {
-  const out = await upstream.listTools()
-  process.stdout.write(JSON.stringify(out.tools.map(t => t.name), null, 2) + '\n')
+  try {
+    const out = await upstream.listTools()
+    process.stdout.write(JSON.stringify(out.tools.map(t => t.name), null, 2) + '\n')
+  } catch (e) {
+    log(`--tools failed: ${e.message}`)
+    await finish(1)
+  }
   await finish(0)
 }
 
@@ -952,7 +1158,7 @@ if (has('--call')) {
 }
 
 await server.connect(new StdioServerTransport())
-if (LINE_MODE === 'on' && channelId) await holdLine()
+if (LINE_MODE === 'on' && channelId && !channelGuessed) await holdLine()
 log(`up on stdio — line mode ${LINE_MODE}${channelId ? '' : ' (channel opens on your first call)'}` +
   ` | spend cap ${MAX_SPEND ? MAX_SPEND + ' ' + spendUnit : 'NONE (PASS_MAX_SPEND=0)'}` +
   ' | stops when stdin closes')

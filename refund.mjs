@@ -1,5 +1,5 @@
-import { getAddress, decodeFunctionData } from 'viem'
-import { BATCH_SETTLEMENT_ADDRESS } from '@x402/evm'
+import { getAddress, decodeFunctionData, recoverTypedDataAddress } from 'viem'
+import { BATCH_SETTLEMENT_ADDRESS, BATCH_SETTLEMENT_DOMAIN, voucherTypes } from '@x402/evm'
 import { computeChannelId } from '@x402/evm/batch-settlement/client'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -132,15 +132,48 @@ export const refundUrlInTerms = (terms) => {
 
 const SELLER_FILE = 'seller.json'
 
-export const readSeller = (dir) => {
-  try { const j = JSON.parse(readFileSync(join(dir, SELLER_FILE), 'utf8')); return j && typeof j === 'object' ? j : {} } catch { return {} }
+export const sellerOf = (u) => { try { return new URL(String(u)).origin } catch { return null } }
+
+const sellerFile = (dir) => {
+  try { const j = JSON.parse(readFileSync(join(dir, SELLER_FILE), 'utf8')); return j && typeof j === 'object' && !Array.isArray(j) ? j : {} } catch { return {} }
+}
+const isRecord = (x) => Boolean(x) && typeof x === 'object' && !Array.isArray(x)
+const sellersIn = (all) => (isRecord(all.sellers) ? all.sellers : {})
+
+export const readSeller = (dir, seller) => {
+  const all = sellerFile(dir)
+  const at = sellerOf(seller)
+  const mine = at && isRecord(sellersIn(all)[at]) ? sellersIn(all)[at] : {}
+  const before = typeof all.refund === 'string' && at && sellerOf(all.refund) === at ? all.refund : null
+  return { refund: typeof mine.refund === 'string' ? mine.refund : before, paying: isRecord(mine.paying) ? mine.paying : {} }
 }
 
-export const rememberRefundUrl = (dir, url) => {
-  const prior = readSeller(dir)
-  if (prior.refund === url) return
-  try { mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, SELLER_FILE), JSON.stringify({ ...prior, refund: url }, null, 2)) } catch { }
+export const channelsElsewhere = (dir, seller) => {
+  const at = sellerOf(seller)
+  const out = new Set()
+  for (const [k, v] of Object.entries(sellersIn(sellerFile(dir)))) {
+    if (k === at || !isRecord(v?.paying)) continue
+    for (const c of Object.values(v.paying)) if (typeof c === 'string') out.add(c.toLowerCase())
+  }
+  return out
 }
+
+const rememberFor = (dir, seller, change) => {
+  const at = sellerOf(seller)
+  if (!at) return
+  const all = sellerFile(dir)
+  const sellers = sellersIn(all)
+  const next = change(isRecord(sellers[at]) ? sellers[at] : {})
+  if (!next) return
+  try { mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, SELLER_FILE), JSON.stringify({ ...all, sellers: { ...sellers, [at]: next } }, null, 2)) } catch { }
+}
+
+export const rememberPayingChannel = (dir, seller, key, channelId) => rememberFor(dir, seller, (mine) => {
+  const paying = isRecord(mine.paying) ? mine.paying : {}
+  return paying[key] === channelId ? null : { ...mine, paying: { ...paying, [key]: channelId } }
+})
+
+export const rememberRefundUrl = (dir, seller, url) => rememberFor(dir, seller, (mine) => (mine.refund === url ? null : { ...mine, refund: url }))
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -207,7 +240,7 @@ export async function passRefund({ url, channelId, signer, payer = signer, selfS
   }
   const problem = (await gasPaymentProblem(a, { relayUrl, maxMicroUSD, chainId, relayFetchFn })) ?? (budget && !budget.allows(Number(a.gasMicroUSD)) ? `the gas, ${a.gasMicroUSD}, and what this run has already paid would pass PASS_MAX_SPEND (${maxMicroUSD})` : null)
   if (problem) return { ...a, op: 'refund_failed', code: 'gas_payment_refused', why: `Nothing was signed: ${problem}. Run --refund --self-send to take a signed refund of the full balance and send it at your own gas.` }
-  log(`the channel's fees do not cover the refund's gas: paying exactly ${a.gasMicroUSD} micro-USD of it in USDC from ${a.authorization.from}, to get ${a.returnedMicroUSD} back`)
+  log(`the channel's fees do not cover the refund's gas: paying the ${a.gasMicroUSD} micro-USD the seller quotes for it (its gas estimate plus 15%) in USDC from ${a.authorization.from}, to get ${a.returnedMicroUSD} back`)
   const signature = await payer.signTypedData(a.sign)
   budget?.spend(Number(a.gasMicroUSD))
   return ask({ gasPayment: { authorization: a.authorization, signature } })
@@ -227,9 +260,33 @@ export async function rebaseChannel(storage, channelId, cs) {
   return true
 }
 
+export async function voucherSigner(ctx, channelId, chainId) {
+  if (!ctx?.signature || ctx.signedMaxClaimable === undefined) return null
+  try {
+    const at = await recoverTypedDataAddress({ domain: { ...BATCH_SETTLEMENT_DOMAIN, chainId, verifyingContract: getAddress(BATCH_SETTLEMENT_ADDRESS) }, types: voucherTypes, primaryType: 'Voucher', message: { channelId, maxClaimableAmount: BigInt(ctx.signedMaxClaimable) }, signature: ctx.signature })
+    return at.toLowerCase()
+  } catch { return null }
+}
+
 export async function channelOnChain(pub, channelId, blockNumber = null) {
   const [balance, totalClaimed] = await pub.readContract({ address: BATCH_SETTLEMENT_ADDRESS, abi: CHANNELS_ABI, functionName: 'channels', args: [channelId], ...(blockNumber !== null ? { blockNumber: BigInt(blockNumber) } : {}) })
   return { channelId: String(channelId).toLowerCase(), balance: String(balance), totalClaimed: String(totalClaimed), chargedCumulativeAmount: String(totalClaimed) }
+}
+
+export async function withdrawable(pub, storage, channelId) {
+  const n = (v) => { try { return BigInt(v ?? 0) } catch { return 0n } }
+  let rec
+  try { rec = await storage.get(channelId) } catch { rec = undefined }
+  let balance, claimed
+  try {
+    const c = await channelOnChain(pub, channelId)
+    balance = n(c.balance)
+    claimed = n(c.totalClaimed)
+  } catch { balance = n(rec?.balance); claimed = 0n }
+  const charged = n(rec?.chargedCumulativeAmount)
+  const owed = charged > claimed ? charged : claimed
+  const left = balance - owed
+  return { id: String(channelId).toLowerCase(), balance, owed, withdrawable: left > 0n ? left : 0n }
 }
 
 const CONFIG = { name: 'config', type: 'tuple', components: [{ name: 'payer', type: 'address' }, { name: 'payerAuthorizer', type: 'address' }, { name: 'receiver', type: 'address' }, { name: 'receiverAuthorizer', type: 'address' }, { name: 'token', type: 'address' }, { name: 'withdrawDelay', type: 'uint40' }, { name: 'salt', type: 'bytes32' }] }

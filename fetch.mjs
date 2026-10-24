@@ -4,7 +4,7 @@ import { toClientEvmSigner } from '@x402/evm'
 import { FileClientChannelStorage } from '@x402/evm/batch-settlement/client/file-storage'
 import { computeChannelId, buildChannelConfig } from '@x402/evm/batch-settlement/client'
 import { unhurried, paymentsFor, selectorFor, floorStrategy, learnFloor, refusedBody, queue, PREFERRED } from './client.mjs'
-import { refundUrlOf, rememberRefundUrl, withGrant } from './refund.mjs'
+import { refundUrlOf, rememberRefundUrl, rememberPayingChannel, withGrant } from './refund.mjs'
 import { withAgent } from './agent.mjs'
 import { parseChallenges, evmCharges, payCharge, credentialHeader, credentialHeaderName, receiptOf } from './mpp.mjs'
 import { sessionOffers, httpTransport } from './session.mjs'
@@ -175,7 +175,8 @@ export function makeFetchTool({ signer, pub, network, grant = null, seller = nul
         break
       }
       const u = refundUrlOf(quoted)
-      if (u) rememberRefundUrl(seat.dir, u)
+      if (u) rememberRefundUrl(seat.dir, url.origin, u)
+      if (settlement) rememberPayingChannel(seat.dir, url.origin, `${signer.address.toLowerCase()} ${salt ?? NO_SALT}`, key)
       const ok = res.status < 400
       const now = await chargedSoFar()
       const charged = settlement ? (now > from ? now - from : 0n) : ok ? amount : 0n

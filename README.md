@@ -1,10 +1,10 @@
 # ZEAM :: Pass client
 
-`@zeampass/client`, version 4.0.0. Source: https://github.com/zeam-labs/x402-mcp-bridge
+`@zeampass/client`, version 4.1.0. Source: https://github.com/zeam-labs/pass-client
 
 The Pass client is for an agent that carries its own wallet: it stands in front of a paid MCP server or URL and pays
 from that wallet. To fund an agent without installing anything, give it a pass, a funded link:
-https://zeampass.com/pass
+https://zeampass.com/
 
 ZEAM :: Pass is the buyer side: a pass, or this client. Over MCP the client pays x402: per call, or it buys time and
 rides a line on a ZEAM :: Bridge seller. Over HTTP, `paid_fetch` pays a URL's 402 as an x402 `exact` payment, as an
@@ -45,7 +45,7 @@ It needs Node.js 20 or later. Export your key as `PASS_PRIVATE_KEY`. It signs lo
   "mcpServers": {
     "prism": {
       "command": "npx",
-      "args": ["-y", "@zeampass/client@4.0.0"],
+      "args": ["-y", "@zeampass/client@4.1.0"],
       "env": { "PASS_PRIVATE_KEY": "0x..." }
     }
   }
@@ -62,11 +62,19 @@ Results pass through whole: `content`, `structuredContent`, `isError` and `_meta
 
 ## Paying per call
 
-1. The Pass client reads the terms once from `/.well-known/x402`, or from the seller's first 402.
+1. The Pass client reads the terms once from the seller's `/.well-known/x402` (Prism publishes it) and pays from them.
+   A seller that publishes none, as a ZEAM :: Bridge seller does not, is asked each time: before every paid call and
+   every `buy_time` purchase the Pass client sends the call unpaid and pays from the 402 that answers it. A run with
+   `PASS_LINE=on` that does not yet know which channel this key and `PASS_SALT` pay this seller asks once before its
+   first purchase: a first run, a run whose state directory holds only other channels, and a run whose recorded
+   channel the seller answers `unknown_channel`. That one ask is the unpaid `buy_time` that learns the channel, after
+   which the Pass client asks for a line on it (a channel the seller does not know yet answers `unknown_channel`)
+   and, when it must buy time, pays from that same 402.
 2. The first paid call deposits into a batch-settlement channel: price × `PASS_DEPOSIT_MULTIPLIER` (default 40,
    minimum 3), raised to the seller's floor (the 402's `deposit` line, or `neededMicroUSD`), and no more than
    `PASS_MAX_SPEND` leaves room for. On Prism: 250 µUSD × 40 = $0.01.
-3. Later calls sign vouchers against that deposit. No gas, no round trip to ask the price.
+3. Later calls sign vouchers against that deposit, with no gas. With the seller's `/.well-known/x402` terms no round
+   trip asks the price; without them each paid call is the unpaid call and then the paid one.
 
 The deposit sits in x402's batch-settlement escrow `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`, hardcoded in
 `@x402/evm`. No owner, no pause, no upgrade. Only your key can withdraw it.
@@ -82,26 +90,51 @@ milliseconds it runs; calls at once burn once.
    less than 250 ms. A seller on an older version of the plugin that sells time in blocks is asked for blocks.
 2. **Open.** `POST <base>/line {"op":"open","channelId"}` returns a message. The Pass client signs it (EIP-191) with the
    payer key and posts `{"op":"prove","channelId","nonce","signature"}`; the answer carries the credential.
+   A line opened on a channel with no other line open switches the channel's meter on. A line opened while another
+   line is open on the channel leaves the meter as it is: if an agent switched it off, the answer's `metering` is
+   `false`, and the Pass client sends `{"op":"on"}` before it rides.
 3. **Ride.** Each time-tool call carries the credential in `_meta["zeam-pass/line"]`; no payment per call. The answer's
-   `_meta["zeam-pass/meter"]` states `msRemaining`. A call runs until the seller answers, the connection drops or
-   the MCP client that asked cancels it, which the Pass client passes on to the seller and which stops its purchases.
+   `_meta["zeam-pass/meter"]` states `msRemaining`. A call runs until the seller answers or the MCP client that asked
+   cancels it, which the Pass client passes on to the seller and which stops its purchases. A hang-up ends the call
+   and its bill on a Node seller and on a Python seller served over ASGI; a WordPress seller, and a Python seller
+   served over WSGI, cannot see one, and the call burns until it returns. Cancel a call before you hang up.
 4. **Stay ahead.** While a call runs the line burns 1 ms per ms and the seller keeps the call going as long as the
    line holds time. When half of `PASS_LINE_AHEAD_MS` is left (or twice the slowest purchase so far, if longer; one
-   that carried a deposit counts only while the next will carry one) the Pass client buys again: as much as the call has run so far, at least `PASS_LINE_AHEAD_MS`. The call is not run
-   again. At `PASS_MAX_SPEND` it stops buying; the call ends when the line runs out and the answer is
-   `x402_bridge_spend_cap_reached`. A purchase that fails is said and tried again; the call runs on what is left.
+   that carried a deposit counts only while the next will carry one) the Pass client buys again: as much as the call has
+   run so far, at least twice that threshold (`PASS_LINE_AHEAD_MS`, or four times the slowest purchase, so a slow
+   purchase still lands with time in hand): no more per purchase than the channel's collateral covers or
+   `PASS_MAX_SPEND` leaves room for, never less than 250 ms. It buys only while a call runs: a purchase whose turn
+   comes after the last call has ended is not made, and one whose price is answered after that is not signed. One
+   already signed when the call ends is completed, and its time stays on the line until a refund returns it. The call
+   is not run again. At `PASS_MAX_SPEND` it stops
+   buying; the call ends when the line runs out and the answer is `x402_bridge_spend_cap_reached`. A purchase that
+   fails is said and tried again; the call runs on what is left.
 5. **Meter.** After `PASS_LINE_IDLE_MS` (default 1000) with no call the Pass client sends `{"op":"off"}`; the next call
-   sends `{"op":"on"}`. `meter_off` is switched on and called again; `line_unknown` opens a new line; `out_of_time`,
+   sends `{"op":"on"}`. The meter is the channel's, not the line's: this `off`, and the `off` on exit, switch it off for
+   every line open on that channel, and another agent riding the same channel must send `on` again. `close` ends only
+   the Pass client's own line; it leaves the meter and every other line as they are.
+   `meter_off` is switched on and called again; `line_unknown` opens a new line; `out_of_time`,
    which now means a purchase failed or came late, buys twice the time and calls again.
-6. **Exit.** On exit the Pass client sends `off`, then `close`. Unburned time comes back with a refund.
+6. **Exit.** Every exit takes one path: the end of `--call` or `--tools`, an error, stdin closing, SIGINT or SIGTERM.
+   The Pass client signs nothing new, waits up to `PASS_EXIT_WAIT_MS` (default 30000) for every purchase still in
+   flight, deposit or voucher, and records each answer in `PASS_STATE_DIR`; then it sends `off`, then `close`. A
+   purchase still unanswered at that bound is said, and the line is let go without its answer. Unburned time comes
+   back with a refund.
 
 `PASS_LINE`:
 
 - `auto` (default): per call until 2 time-tool calls arrive within 10 s
   (`PASS_AUTO_FAST_RUN`, `PASS_AUTO_GAP_MS`), then a line while it holds time.
   A call cut for running past what one call buys (`out_of_time`) is called again on a line.
-  When the seller says how long the call needs (`needsMs`), the Pass client buys that much, plus a quarter, before it
-  calls again.
+  When the seller says how much more the call needs (`needsMs`), the Pass client runs the whole call again, so it buys
+  what the call already ran (the time one call buys) plus `needsMs`, plus a quarter, and never less than
+  `PASS_LINE_AHEAD_MS`, before it calls again. A call already on a line that is cut with `needsMs` is called
+  again on what it ran plus `needsMs`, plus half; no purchase is under 250 ms. It calls a cut call again at most three
+  times on a line; a call still cut after that answers with the seller's cut: what the call got done, and `needsMs` for
+  what is left. Where the seller's cut says how to continue, continue from that answer, and continue a continuation that
+  is cut again the same way, from its own answer: the wallet-audits scans say to call again with `to_block` one below
+  `scanned.from`, and each cut's `needsMs` is for what is left below its own `scanned.from`, so a continuation cut
+  again is called with `to_block` one below the new `scanned.from`, and needs the new `needsMs`.
 - `on`: every time-tool call rides a line.
 - `off`: per call only.
 
@@ -112,16 +145,38 @@ Tools priced per call never ride a line.
     npx -y @zeampass/client --refund
 
 1. The Pass client posts `{channelId, issued, signature}` to the refund route the seller names (its 402 or
-   `/.well-known/x402`), else `<base>/refund`. The key signs:
+   `/.well-known/x402`), else `<base>/refund`. The channel is the one this key and `PASS_SALT` pay: the one the
+   seller's `/.well-known/x402` fixes, or, against a seller that publishes none, the one a run from this
+   `PASS_STATE_DIR` last paid into with them. The seller is the one in `PASS_MCP_URL`, by its origin: a state
+   directory shared by several sellers keeps each one's refund route and channel apart, and `--refund` asks only
+   that seller, for its own channel. When no run from this `PASS_STATE_DIR` recorded that channel (a state directory
+   from 4.0.0 or earlier, or a lost one), the Pass client works it out from this key, `PASS_SALT` and the seller's
+   terms (against a seller that publishes none, it calls one paid tool unpaid, `buy_time` where there is one, to read
+   its 402), and asks for it when it holds something the payer can withdraw: the escrow's balance for it, less what
+   the seller has claimed or is owed (the larger of the escrow's `totalClaimed` and the amount charged that this
+   state directory records), as the seller judges a refund; it then records it. When that channel holds nothing the
+   payer can withdraw, `--refund` says so, with its balance and what the seller has claimed or is owed, asks nobody
+   and exits 2. A channel recorded at another
+   seller, or paid with another key or `PASS_SALT`, is never asked for; when none is this seller's, `--refund` says so
+   and asks nobody. `--refund --channel <id>` asks this seller for that channel by name: the seller refunds it only
+   to a proof signed by the channel's payer, and a channel whose voucher in the state directory another key signed is
+   not asked for. The key signs:
 
         ZEAM Pass refund
         channel: <channel id, lowercase>
         issued: <ISO time>
 
-2. When the channel's fees cover the gas, the seller sends the balance and the unburned time: `returnedMicroUSD`,
+2. Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the
+   refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for
+   on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted
+   before the buyer signs that payment. Our fee is the fee share the seller's `refund` terms name: 9.99% for most
+   sellers, 100% at Prism. The seller counts the gas at the current gas and ETH price: free when
+   `feeMicroUSD >= coverMicroUSD`. Then the seller sends the balance and the unburned time: `returnedMicroUSD`,
    `timeReturnedMs`, `gasMicroUSD: 0`.
-3. When they do not, the seller answers 409 `refund_quote` with the exact gas. The Pass client signs a gasless USDC
-   payment of it and posts again; one transaction returns the rest.
+3. When they do not, the seller answers 409 `refund_quote` with `feeMicroUSD`, `coverMicroUSD` and `gasMicroUSD`: this
+   refund's gas, as the relay estimates it now, plus 15%. The Pass client signs a gasless USDC payment of it and posts
+   again; one transaction returns the rest. If the gas has risen past the payment by the time the relay sends,
+   nothing is sent and the answer is `refund_quote` with `requoted: true` and the new figure: run `--refund` again.
 4. When the gas is more than what is left: `nothing_to_return` with the numbers.
 
 `--refund --self-send` asks for a signed refund of all of it and sends it from your key, at your gas, if the key holds
@@ -129,7 +184,7 @@ ETH on Base. Otherwise it prints the transaction for any wallet to send.
 
 No answer from the seller: `initiateWithdraw`, then `finalizeWithdraw` after the channel's `withdrawDelay`.
 
-`--refund` also closes an MPP session channel: see *Paying by session*.
+`--refund` also closes the MPP session channels opened at that seller: see *Paying by session*.
 
 ## Paying by session
 
@@ -137,7 +192,9 @@ An MPP `session` (`draft-evm-session-00`, method `evm`) is a payment channel in 
 one signed voucher per call for the running total, and what is not spent comes back when the channel closes. The
 seller's relay sends the deposit from an EIP-3009 authorization the key signs, so the key needs USDC and no ETH.
 
-It is off until you pin an escrow. No escrow is built in: the contracts are deployed on Base and are not audited.
+It is off until you pin an escrow. No escrow is built in. ZEAM's session contracts are the escrow `EvmPaymentChannel`
+at `0x5e09aD70b644414cD1cD7Df1d9a10fF7899D92B8` on Base and its payee factory at
+`0xE18fCE1266056becA4a3B0edfc15F8634EA6901B`: both deployed on 2026-10-13, immutable, and not audited.
 
 - `PASS_SESSION_ESCROW`: the escrow, or escrows, the Pass client may pay into. A session into any other escrow is not
   paid.
@@ -176,12 +233,12 @@ What it signs, over MCP and in `paid_fetch` alike:
 Leaving:
 
 - `--refund` asks the seller to close the channel: the seller is paid what was spent and the rest returns to the key
-  in the same transaction. When the channel's fees do not cover that transaction's gas, the seller quotes it and the
+  in the same transaction. When the channel's fees do not cover that transaction's gas plus 15%, the seller quotes it and the
   Pass client pays it in USDC out of what returns, under the checks in Limits. The key needs no ETH.
 - `--refund --exit` leaves without the seller and without ETH, through the relay: a close request signed by the key,
   and, run again after the escrow's grace period (15 minutes in ZEAM's escrow), a signed withdrawal of everything the seller has not
   settled. These two signed calls are ZEAM's addition to the draft's escrow. The relay sends them free when the fees
-  on what the channel has settled cover their gas. When they do not, the Pass client asks the relay its price and
+  on what the channel has settled cover their gas plus 15%. When they do not, the Pass client asks the relay its price and
   signs the withdrawal and a USDC payment of that price along with the request; the relay sends the request, holds
   the rest and sends it after the grace period. The gas comes out of what returns, the key needs no ETH, and there is
   nothing to run again: a later `--refund` shows the channel closed. The relay needs the seller's split, which a ZEAM :: Bridge seller
@@ -190,6 +247,11 @@ Leaving:
   The Pass client uses it only when the 0xSplits factory gives the seller's split address for it.
 - `--refund --self-send` sends the draft's own `requestClose`, and after the grace period `withdraw`, from the key at
   its own gas. It needs nothing from the seller or the relay.
+- A channel that already has a close request on chain, sent from another state directory or by another tool, is
+  not closed through the seller: `--refund` answers `session_exit_waiting` with when the withdrawal can be sent
+  (`readyAt`) and, once the grace period has passed, sends the withdrawal through the relay when the relay sends it
+  free. When the relay asks for its gas, `--refund` signs nothing and says so; `--refund --exit` pays that gas in USDC
+  out of what returns, and `--refund --self-send` sends `withdraw` at the key's own gas.
 
 ## Gates and grants
 
@@ -291,8 +353,11 @@ client.
 - `PASS_MCP_URL` (default `https://mcp.zeamprism.com/mcp`): any x402 MCP
   endpoint.
 - `PASS_LINE` (default `auto`): `auto`, `on`, `off`.
-- `PASS_LINE_AHEAD_MS` (default `2000`): line time kept ahead of a call; the least bought per `buy_time`.
+- `PASS_LINE_AHEAD_MS` (default `2000`): line time kept ahead of a call; the least bought per `buy_time` while the
+  channel's collateral and `PASS_MAX_SPEND` leave room for it.
 - `PASS_LINE_IDLE_MS` (default `1000`): meter off after this idle.
+- `PASS_EXIT_WAIT_MS` (default `30000`): how long an exit waits for a purchase in flight to be answered before it
+  lets the line go.
 - `PASS_MAX_SPEND` (default `10000000`, $10): ceiling on what this run pays, µUSD; `0` removes it. Every deposit
   and top-up counts when it is signed, x402 or session, for an MCP tool or in `paid_fetch`; so does every signed
   transfer: an `exact` payment, an MPP charge, a gas payment. A call paid out of a deposit this run signed is not
@@ -304,7 +369,8 @@ client.
 - `PASS_GRANT` (no default): `x-grant` on every request to the seller's own origin.
 - `PASS_RPC_URL` (default the chain's public RPC): your node for chain reads.
 - `PASS_STATE_DIR` (default `~/.x402-mcp-bridge/<host>/<address>`): channel
-  state; keep it.
+  state, and in `seller.json`, for each seller by origin, its refund route and the channel each key and `PASS_SALT`
+  last paid into there; keep it.
 - `PASS_SALT` (default the scheme's): a distinct channel.
 - `PASS_ASSET` (default first quoted): address or symbol.
 - `PASS_NETWORK` (default `eip155:8453`): CAIP-2.
@@ -322,8 +388,9 @@ approval.
 
 ## Limits
 
-- It exits when stdin closes, and lets its line go.
-- It stops at `PASS_MAX_SPEND`: further calls return `x402_bridge_spend_cap_reached`.
+- It exits when stdin closes, and lets its line go once the purchases in flight are answered.
+- It stops at `PASS_MAX_SPEND`: further calls return `x402_bridge_spend_cap_reached`, with `spentMicroUSD`, what
+  this run counted toward it, and `capMicroUSD`, for an MCP tool and from `paid_fetch` alike.
 - On `--refund`, when the seller asks for the refund's gas in USDC, it signs only a payment to the relay's own gas
   wallet, in USDC on its own chain, for the amount quoted, no more than twice what the relay prices that
   gas at, less than the refund and within `PASS_MAX_SPEND`. Otherwise it signs nothing and says why. The relay is
@@ -335,9 +402,11 @@ approval.
   this falls inside the grace period. Signed after the request is on chain, it is valid from the end of that
   request's grace period. A close's gas payment is signed only when it is valid at once and for
   no more than 10 minutes, is less than what the escrow shows would return, and the relay does not say the channel's
-  fees cover the gas. Each payment is kept in the channel's record, and no other is signed for that channel while one
-  is unexpired and unused: the same one is sent again, or `--refund` says until when to wait
-  (`gas_payment_pending`).
+  fees cover the gas. When the Pass client does not sign it, the answer keeps the seller's `code: "gas_payment_needed"`,
+  `leftMicroUSD`, `returnedMicroUSD`, `gasMicroUSD` and its detail as `why`, and adds `refused: "gas_payment_refused"`
+  and `refusedWhy`, the Pass client's reason. Each payment is kept in the channel's record, and no other is signed
+  for that channel while one is unexpired and unused: the same one is sent again, or `--refund` says until when to
+  wait (`gas_payment_pending`).
 - On `--refund --self-send` it sends only the escrow's signed refund of this channel: `refundWithSignature`, alone
   or with its claim in the escrow's `multicall`. Any other transaction a seller hands back is not sent; the answer
   is `signed_refund_refused` and says why. `initiateWithdraw` needs nothing from the seller.
@@ -345,14 +414,17 @@ approval.
   before sending but holds no ETH price of its own, and a price asked of the seller or the relay would make the exit
   depend on them. It sends only when the key holds 1.5 × the estimate, and the answer states what was paid
   (`gasWei`).
-- Lost state costs one probe to resync, then one deposit.
+- Lost state is rebuilt from the seller: the first payment on the channel after it is lost is refused with the
+  seller's corrective 402, which carries the channel's state, and is made again from that state; nothing is charged
+  for the refused one. Against a seller that publishes no `/.well-known/x402` terms, the unpaid calls that ask the
+  price come first. A channel that holds nothing then takes one deposit.
 
 ## Verify before you run it
 
 The versions are pinned exactly.
 
-    npm view @zeampass/client@4.0.0 version dist.integrity
-    npm pack @zeampass/client@4.0.0
+    npm view @zeampass/client@4.1.0 version dist.integrity
+    npm pack @zeampass/client@4.1.0
     less package/index.mjs
 
 Apache-2.0. Patent pending.

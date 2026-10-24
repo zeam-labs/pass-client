@@ -1,5 +1,5 @@
 import { createPublicClient, createWalletClient, http as plainHttp, fallback, keccak256, toHex } from 'viem'
-import { passRefund, rebaseChannel, sendSignedRefund, refundUrlBeside, refundUrlInTerms, readSeller, rememberRefundUrl, hearingHttp, withGrant } from './refund.mjs'
+import { passRefund, channelOnChain, withdrawable, rebaseChannel, sendSignedRefund, refundUrlBeside, refundUrlInTerms, readSeller, rememberRefundUrl, rememberPayingChannel, channelsElsewhere, hearingHttp, withGrant } from './refund.mjs'
 import { floorStrategy, learnFloor, unhurried, queue } from './client.mjs'
 import { setting, TAG } from './env.mjs'
 import { withAgent } from './agent.mjs'
@@ -7,7 +7,7 @@ import { LINE_HEADER, LINE_GONE, lineUrlOf, lineUrlBeside, timeFromTerms, timeTe
 import { privateKeyToAccount } from 'viem/accounts'
 import * as chains from 'viem/chains'
 import { x402Client, x402HTTPClient, wrapFetchWithPayment } from '@x402/fetch'
-import { BatchSettlementEvmScheme } from '@x402/evm/batch-settlement/client'
+import { BatchSettlementEvmScheme, buildChannelConfig, computeChannelId } from '@x402/evm/batch-settlement/client'
 import { FileClientChannelStorage } from '@x402/evm/batch-settlement/client/file-storage'
 import { toClientEvmSigner } from '@x402/evm'
 import { mkdirSync, readdirSync } from 'node:fs'
@@ -99,15 +99,20 @@ function wallet({ key, url, network, stateDir, depositMultiplier, asset, salt, r
     b.last = null
   }
   const storage = new FileClientChannelStorage({ directory: dir })
-  const state = { channelId: null }
+  const state = { channelId: null, recorded: false }
+  const payingKey = `${account.address.toLowerCase()} ${salt ? saltOf(salt) : `0x${'00'.repeat(32)}`}`
   try {
-    const f = readdirSync(join(dir, 'client')).find((n) => n.endsWith('.json'))
-    if (f) state.channelId = f.replace(/\.json$/, '')
+    const files = readdirSync(join(dir, 'client')).filter((n) => n.endsWith('.json')).map((n) => n.replace(/\.json$/, ''))
+    const recorded = readSeller(dir, url).paying[payingKey]
+    const elsewhere = channelsElsewhere(dir, url)
+    const mine = files.find((c) => typeof recorded === 'string' && c.toLowerCase() === recorded.toLowerCase())
+    const f = mine ?? files.find((c) => !elsewhere.has(c.toLowerCase()))
+    if (f) { state.channelId = f; state.recorded = Boolean(mine) }
   } catch { }
   const watched = {
     get: (k) => storage.get(k),
     delete: (k) => { if (state.channelId === k) state.channelId = null; return storage.delete(k) },
-    set: (k, ctx) => { state.channelId = k; return storage.set(k, ctx) },
+    set: (k, ctx) => { state.channelId = k; state.recorded = true; rememberPayingChannel(dir, url, payingKey, String(k).toLowerCase()); return storage.set(k, ctx) },
   }
   const payments = new x402Client(selector).register(network,
     new BatchSettlementEvmScheme(toClientEvmSigner(account, pub), {
@@ -118,15 +123,15 @@ function wallet({ key, url, network, stateDir, depositMultiplier, asset, salt, r
     }))
   payments.onAfterPaymentCreation(signed)
   const httpClient = new x402HTTPClient(payments)
-  const seller = { refund: readSeller(dir).refund ?? null }
+  const seller = { refund: readSeller(dir, url).refund }
   const bare = withAgent(unhurried())
-  const net = hearingHttp(withGrant(bare, grant, url), (u) => { seller.refund = u; rememberRefundUrl(dir, u) }, (t) => learnFloor(floor, t))
+  const net = hearingHttp(withGrant(bare, grant, url), (u) => { seller.refund = u; rememberRefundUrl(dir, url, u) }, (t) => learnFloor(floor, t))
   const paidFetch = wrapFetchWithPayment(net, payments)
   const oneAtATime = queue()
   log(`paying as ${account.address}, state in ${dir}`)
   const wallets = createWalletClient({ account, chain: payChain, transport: plainHttp(rpcUrl ?? payChain.rpcUrls?.default?.http?.[0]) })
   const request = (fn) => asking.run(fresh(), async () => { try { return await fn() } catch (e) { throw capOf(e) ?? e } })
-  return { account, state, seller, floor, net, bare, storage: watched, pub, wallets, payments, httpClient, paidFetch, oneAtATime, dir, depositMultiplier: Number(depositMultiplier ?? 40), here, roomOf, notTaken, request, capOf }
+  return { account, state, payingKey, seller, floor, net, bare, storage: watched, pub, wallets, payments, httpClient, paidFetch, oneAtATime, dir, depositMultiplier: Number(depositMultiplier ?? 40), here, roomOf, notTaken, request, capOf }
 }
 
 function line({ url, w, aheadMs, idleMs, dropAfterMs, maxMicroUSD, log }) {
@@ -213,8 +218,9 @@ function line({ url, w, aheadMs, idleMs, dropAfterMs, maxMicroUSD, log }) {
     const t = await terms()
     return s.time ?? { rateMicro: Number(t?.accepts?.[0]?.amount ?? 250), rateMs: 250, maxMs: 14400 * 250, buys: 'blocks' }
   }
-  const buyOnce = (wantMs) => w.oneAtATime(async () => {
+  const buyOnce = (wantMs, running = null) => w.oneAtATime(async () => {
     if (!s.credential) return false
+    if (running && !running()) return null
     const from = Date.now()
     const time = await rate()
     const t = s.terms
@@ -224,6 +230,7 @@ function line({ url, w, aheadMs, idleMs, dropAfterMs, maxMicroUSD, log }) {
     const buy = buyFor({ wantMs: Math.min(wantMs, fits), time, availableMicro: await available(), depositMultiplier: w.depositMultiplier })
     const body = JSON.stringify(buy.args)
     const post = async (rows) => {
+      if (running && !running()) return null
       const quote = timeTerms({ x402Version: t.x402Version ?? 2, accepts: rows }, buy.micro)
       w.here().last = null
       const payload = await w.payments.createPaymentPayload(quote)
@@ -237,17 +244,20 @@ function line({ url, w, aheadMs, idleMs, dropAfterMs, maxMicroUSD, log }) {
       const left = await available()
       const short = left !== null && left < buy.micro
       r = await post(short ? t.funding : t.accepts)
+      if (r === null) return null
       if (r.status === 402) {
         w.notTaken()
         const j = await r.clone().json().catch(() => null)
         if (j?.code === 'funding_requires_open_fee' && !short) {
           log('this purchase carries a deposit on the funding row')
           r = await post(Array.isArray(j.accepts) && j.accepts.length ? j.accepts : t.funding)
+          if (r === null) return null
           if (r.status === 402) w.notTaken()
         } else { s.terms = null; r = null }
       }
     }
     if (!r) {
+      if (running && !running()) return null
       w.here().last = null
       r = await w.paidFetch(new URL('/v1/buy_time', url), { method: 'POST', headers: { 'content-type': 'application/json' }, body })
       if (r.status === 402) w.notTaken()
@@ -270,8 +280,9 @@ function line({ url, w, aheadMs, idleMs, dropAfterMs, maxMicroUSD, log }) {
     if (buyFor({ wantMs: 0, time }).micro > room) return stop()
     const fits = Number.isFinite(room) ? Math.floor(room / time.rateMicro) * time.rateMs : wantMs
     let capErr = false
-    const micro = await buyOnce(Math.min(wantMs, fits)).catch((e) => { capErr = Boolean(w.capOf(e)); return false })
+    const micro = await buyOnce(Math.min(wantMs, fits), () => s.calls > 0).catch((e) => { capErr = Boolean(w.capOf(e)); return false })
     if (capErr) return stop()
+    if (micro === null) { log('no line time bought: the request it was for has ended'); return null }
     if (!micro) { log(`could not buy more line time while a request runs: it keeps running on the ${Math.round(Math.max(0, lineLeft()))}ms left`); return false }
     return true
   }
@@ -363,13 +374,30 @@ export function client(opts = {}) {
     throw new Error(`${TAG} could not hold a line after four attempts`)
   }
 
+  const derived = async () => {
+    const row = (l.s.terms?.funding ?? []).find((a) => a.scheme === 'batch-settlement' && a.network === network)
+    if (!row) return null
+    let id
+    try { id = computeChannelId(buildChannelConfig({ signer: { address: w.account.address }, salt: salt ? saltOf(salt) : `0x${'00'.repeat(32)}` }, row), row.network).toLowerCase() } catch { return null }
+    const h = await withdrawable(w.pub, w.storage, id)
+    return h.balance > 0n ? h : null
+  }
   const refund = async ({ selfSend = false } = {}) => {
     await l.off().catch(() => {})
     l.drop('refunding')
     await w.oneAtATime(() => {})
-    const channelId = w.state.channelId
-    if (!channelId) return { op: 'refund_failed', why: 'no channel' }
     await l.terms()
+    let channelId = w.state.channelId
+    if (!channelId || !w.state.recorded) {
+      const d = await derived()
+      if (d && d.withdrawable <= 0n) return { op: 'refund_failed', code: 'nothing_to_return', channelId: d.id, balance: String(d.balance), owed: String(d.owed), withdrawable: '0', why: `nothing to refund at ${new URL(url).origin}: the channel this key and salt pay there, ${d.id}, worked out from the seller's terms, holds nothing the payer can withdraw (balance ${d.balance}, ${d.owed} claimed by or owed to the seller). Nothing was asked` }
+      if (!d) return channelId ? { op: 'refund_failed', why: `no channel recorded for this key and salt at ${new URL(url).origin}; ${channelId} was not paid with them here and is not asked for` } : { op: 'refund_failed', why: 'no channel' }
+      channelId = d.id
+      w.state.channelId = d.id
+      w.state.recorded = true
+      rememberPayingChannel(w.dir, url, w.payingKey, d.id)
+      log(`no channel recorded for this key and salt at ${new URL(url).origin}; the seller's terms give it as ${d.id}, from which the payer can withdraw ${d.withdrawable} (balance ${d.balance}, ${d.owed} claimed by or owed to the seller): asking for it`)
+    }
     const passUrl = w.seller.refund ?? refundUrlBeside(url)
     const gas = { spent: 0 }
     let a = await passRefund({ url: passUrl, channelId, signer: w.account, selfSend, relayUrl, maxMicroUSD, budget: { allows: (u) => !maxMicroUSD || gas.spent + u <= maxMicroUSD, spend: (u) => { gas.spent += u } }, chainId: w.pub.chain?.id, fetchFn: w.net, relayFetchFn: w.bare, log })
