@@ -12,20 +12,6 @@ MPP charge, or from an x402 `batch-settlement` channel. It works with ZEAM Prism
 With a session escrow pinned in `PASS_SESSION_ESCROW` it also pays by MPP `session`, over MCP and over HTTP: see
 *Paying by session*.
 
-## Formerly x402-mcp-bridge
-
-Up to 3.2.2 this was `@zeam-labs/x402-mcp-bridge`. It is now part of ZEAM :: Pass and pays MPP charges as well as
-x402. What you already run keeps working:
-
-- `@zeam-labs/x402-mcp-bridge` 3.2.2 and earlier stay on npm and run as before; new versions are
-  `@zeampass/client`;
-- the command `x402-mcp-bridge` is installed beside `zeam-pass`;
-- every `X402_…` setting is read when its `PASS_…` name is not set. With both set and different, `PASS_…`
-  wins and the Pass client says so once on stderr;
-- the tool name `x402_fetch` is answered as `paid_fetch`. Only `paid_fetch` is listed;
-- the state directory is still `~/.x402-mcp-bridge`, so a channel you funded is still found;
-- the error code `x402_bridge_spend_cap_reached` is unchanged.
-
 ## Run it
 
 `--help` and `--version` print and exit; neither contacts a server.
@@ -426,5 +412,17 @@ The versions are pinned exactly.
     npm view @zeampass/client@4.1.0 version dist.integrity
     npm pack @zeampass/client@4.1.0
     less package/index.mjs
+
+## Upgrading from @zeam-labs/x402-mcp-bridge
+
+Up to 3.2.2 the Pass client was published as `@zeam-labs/x402-mcp-bridge`. Those versions stay on npm and run as before.
+Moving to `@zeampass/client` changes nothing you run:
+
+- the command `x402-mcp-bridge` is installed beside `zeam-pass`;
+- every `X402_…` setting is read when its `PASS_…` name is not set. With both set and different, `PASS_…`
+  wins and the Pass client says so once on stderr;
+- the tool name `x402_fetch` is answered as `paid_fetch`. Only `paid_fetch` is listed;
+- the state directory is still `~/.x402-mcp-bridge`, so a channel you funded is still found;
+- the error code `x402_bridge_spend_cap_reached` is unchanged.
 
 Apache-2.0. Patent pending.
