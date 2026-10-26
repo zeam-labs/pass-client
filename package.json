@@ -1,7 +1,8 @@
 {
   "name": "@zeampass/client",
-  "version": "4.1.0",
-  "description": "The ZEAM :: Pass client puts a wallet in front of a paid MCP server or URL. Over MCP it pays x402 per call, or line time on a ZEAM :: Bridge seller, and, with a session escrow pinned, an MPP session. Over HTTP its paid_fetch tool pays a 402 as an x402 exact payment, as an MPP charge (method evm, on Base) or from an x402 batch-settlement channel.",
+  "version": "4.1.1",
+  "mcpName": "com.zeamprism/pass-client",
+  "description": "@zeampass/client, the buyer side of ZEAM :: Pass: a wallet in front of a paid MCP server or URL. It pays by x402 or MPP, on Base or the chain PASS_NETWORK names, and signs locally. With no arguments it is a stdio MCP server; a key adds paid_fetch.",
   "keywords": [
     "x402",
     "mpp",
@@ -16,8 +17,7 @@
     "usdc",
     "base",
     "zeam",
-    "zeam-pass",
-    "prism"
+    "zeam-pass"
   ],
   "author": "ZEAM Labs, LLC <info@zeamlabs.com> (https://www.zeamlabs.com)",
   "type": "module",
@@ -64,7 +64,7 @@
     "type": "git",
     "url": "https://github.com/zeam-labs/pass-client"
   },
-  "homepage": "https://zeamprism.com/connect",
+  "homepage": "https://zeampass.com/agents",
   "exports": {
     ".": "./index.mjs",
     "./viem": "./viem.mjs",

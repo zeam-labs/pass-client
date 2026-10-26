@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.1.1
+
+- `package.json` carries `"mcpName": "com.zeamprism/pass-client"`, the name the official MCP registry lists the Pass client under. The registry accepts an npm package only when the published `package.json` names the same server, so the name has to be inside a release on npm. `server.json` describes the listing (schema 2025-12-11) and `glama.json` names the maintainer for Glama; the GitHub copy carries both. Nothing the Pass client does changes.
+- The npm description is whole: 4.1.0's was cut off mid-word at npm's 255-character limit. The description, the README title and the README's wording call the package `@zeampass/client`, the buyer side of ZEAM :: Pass, and give Prism its full name, ZEAM :: Prism. The homepage is https://zeampass.com/agents, not Prism's connect page, and the `prism` keyword is gone. `server.json` agrees: its title, description and website. Nothing the client does changes.
+
 ## 4.1.0
 
 - The README states the free-refund rule in the one sentence the Bridge terms, the seller docs and the sellers' 402 carry: "Our relay pays the gas of a refund when our fee on what the buyer spent covers the gas of the deposit, of the refund and of settling any calls not yet settled, and of every further deposit and every earlier refund it paid for on that channel, with a 15% margin; otherwise the buyer pays the refund's gas, with a 15% margin, in USDC, quoted before the buyer signs that payment." The fee share it names stays beside it. A test fails on the README when the sentence is gone or the rule is said in other words.

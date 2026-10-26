@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.zeamprism/pass-client",
+  "title": "@zeampass/client",
+  "description": "The buyer side of ZEAM :: Pass: a wallet in front of a paid MCP server or URL. Pays by x402 or MPP.",
+  "version": "4.1.1",
+  "websiteUrl": "https://zeampass.com/agents",
+  "repository": {
+    "url": "https://github.com/zeam-labs/pass-client",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@zeampass/client",
+      "version": "4.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PASS_PRIVATE_KEY",
+          "description": "The key of the wallet that pays. It signs locally and is never sent. Without it the client lists tools and calls the free ones.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "PASS_MCP_URL",
+          "description": "The paid MCP endpoint to stand in front of: any x402 MCP endpoint.",
+          "isRequired": false,
+          "format": "string",
+          "default": "https://mcp.zeamprism.com/mcp"
+        },
+        {
+          "name": "PASS_MAX_SPEND",
+          "description": "Ceiling on what one run pays, in millionths of a dollar. 0 removes it.",
+          "isRequired": false,
+          "format": "number",
+          "default": "10000000"
+        }
+      ]
+    }
+  ]
+}
