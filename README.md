@@ -1,6 +1,6 @@
 # @zeampass/client
 
-`@zeampass/client`, version 4.1.1. Source: https://github.com/zeam-labs/pass-client
+`@zeampass/client`, version 4.1.2. Source: https://github.com/zeam-labs/pass-client
 
 The buyer side of ZEAM :: Pass, for an agent that carries its own wallet: it stands in front of a paid MCP server or URL and pays
 from that wallet. To fund an agent without installing anything, give it a pass, a funded link:
@@ -31,7 +31,7 @@ It needs Node.js 20 or later. Export your key as `PASS_PRIVATE_KEY`. It signs lo
   "mcpServers": {
     "prism": {
       "command": "npx",
-      "args": ["-y", "@zeampass/client@4.1.1"],
+      "args": ["-y", "@zeampass/client@4.1.2"],
       "env": { "PASS_PRIVATE_KEY": "0x..." }
     }
   }
@@ -121,7 +121,8 @@ milliseconds it runs; calls at once burn once.
   is cut again the same way, from its own answer: the wallet-audits scans say to call again with `to_block` one below
   `scanned.from`, and each cut's `needsMs` is for what is left below its own `scanned.from`, so a continuation cut
   again is called with `to_block` one below the new `scanned.from`, and needs the new `needsMs`.
-- `on`: every time-tool call rides a line.
+- `on`: every time-tool call rides a line and is never paid per call. When no line can be had (it does not open, or it
+  runs out and purchases fail), the call answers `pass_client_no_line` with the reason.
 - `off`: per call only.
 
 Tools priced per call never ride a line.
@@ -146,7 +147,11 @@ Tools priced per call never ride a line.
    seller, or paid with another key or `PASS_SALT`, is never asked for; when none is this seller's, `--refund` says so
    and asks nobody. `--refund --channel <id>` asks this seller for that channel by name: the seller refunds it only
    to a proof signed by the channel's payer, and a channel whose voucher in the state directory another key signed is
-   not asked for. The key signs:
+   not asked for. A session channel named so (one this state directory records, or one a pinned session escrow holds)
+   is left only as *Paying by session* says; no x402 refund is asked for it. `--channel` leaves that channel alone:
+   the other session channels this state directory records at that seller are not left and not mentioned, and an x402
+   channel named so leaves no session channel. A session channel named so that this state directory does not record
+   open, for this key at that seller, is refused: it says so, leaves nothing, asks nobody and exits 2. The key signs:
 
         ZEAM Pass refund
         channel: <channel id, lowercase>
@@ -170,7 +175,8 @@ ETH on Base. Otherwise it prints the transaction for any wallet to send.
 
 No answer from the seller: `initiateWithdraw`, then `finalizeWithdraw` after the channel's `withdrawDelay`.
 
-`--refund` also closes the MPP session channels opened at that seller: see *Paying by session*.
+`--refund` also closes the MPP session channels opened at that seller, and `--refund --channel <id>` only the one it
+names: see *Paying by session*.
 
 ## Paying by session
 
@@ -375,8 +381,9 @@ approval.
 ## Limits
 
 - It exits when stdin closes, and lets its line go once the purchases in flight are answered.
-- It stops at `PASS_MAX_SPEND`: further calls return `x402_bridge_spend_cap_reached`, with `spentMicroUSD`, what
-  this run counted toward it, and `capMicroUSD`, for an MCP tool and from `paid_fetch` alike.
+- It stops buying at `PASS_MAX_SPEND`: a call that would need a payment returns `x402_bridge_spend_cap_reached`,
+  with `spentMicroUSD`, what this run counted toward it, and `capMicroUSD`, for an MCP tool and from `paid_fetch`
+  alike. A call that rides line time already bought is still sent, until the line runs out.
 - On `--refund`, when the seller asks for the refund's gas in USDC, it signs only a payment to the relay's own gas
   wallet, in USDC on its own chain, for the amount quoted, no more than twice what the relay prices that
   gas at, less than the refund and within `PASS_MAX_SPEND`. Otherwise it signs nothing and says why. The relay is
@@ -409,8 +416,8 @@ approval.
 
 The versions are pinned exactly.
 
-    npm view @zeampass/client@4.1.1 version dist.integrity
-    npm pack @zeampass/client@4.1.1
+    npm view @zeampass/client@4.1.2 version dist.integrity
+    npm pack @zeampass/client@4.1.2
     less package/index.mjs
 
 ## Upgrading from @zeam-labs/x402-mcp-bridge

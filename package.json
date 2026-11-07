@@ -1,6 +1,6 @@
 {
   "name": "@zeampass/client",
-  "version": "4.1.1",
+  "version": "4.1.2",
   "mcpName": "com.zeamprism/pass-client",
   "description": "@zeampass/client, the buyer side of ZEAM :: Pass: a wallet in front of a paid MCP server or URL. It pays by x402 or MPP, on Base or the chain PASS_NETWORK names, and signs locally. With no arguments it is a stdio MCP server; a key adds paid_fetch.",
   "keywords": [

@@ -68,6 +68,7 @@ if (has('--help') || has('-h')) {
     '  --refund --self-send  a signed refund, sent from this key at its own gas.',
     '  --refund --exit     leave an MPP session channel without the seller: the close request, then after the grace period the withdrawal.',
     '  --refund --channel <id>  ask for that channel by name: the seller refunds it only to a proof signed by its payer.',
+    '                      A session channel named so is the only one left; the others are not touched.',
     '',
   ].join('\n'))
   process.exit(0)
@@ -272,7 +273,6 @@ const notePaid = (units) => {
   capReached = true
   log(`SPEND CAP REACHED — this run has spent ${spentMicroUSD} ${spendUnit} against a cap of ` +
     `${MAX_SPEND}. Paying for nothing further. Raise or remove it with PASS_MAX_SPEND.`)
-  letGo('spend cap reached')
 }
 
 const saltOf = (raw) => {
@@ -443,7 +443,9 @@ if (has('--refund')) {
     process.stderr.write(`--channel takes a channel id, 0x and 64 hex digits; "${named}" is not one. Nothing was asked.\n`)
     process.exit(2)
   }
-  const left = sessions ? await sessions.leave({ dir: stateDir, origin: sellerOf(UPSTREAM), transportFor: sessionRoute, forced: has('--exit'), selfSend,
+  const namedId = named === null ? null : named.toLowerCase()
+  const session = namedId && sessions ? await sessions.sessionOf(stateDir, namedId) : null
+  const left = sessions && (!namedId || session) ? await sessions.leave({ dir: stateDir, origin: sellerOf(UPSTREAM), channelId: namedId, transportFor: sessionRoute, forced: has('--exit'), selfSend,
     wallet: selfSend ? createWalletClient({ account, chain, transport: http(setting('RPC_URL') ?? chain.rpcUrls.default.http[0]) }) : null }) : []
   for (const a of left) {
     process.stdout.write(JSON.stringify(a, null, 2) + '\n')
@@ -456,11 +458,16 @@ if (has('--refund')) {
   }
   const sessionsLeft = left.some((a) => a.op !== 'session_closed')
   if (named) {
-    const id = named.toLowerCase()
+    const id = namedId
     const signer = await voucherSigner(await storage.get(id).catch(() => undefined), id, chainId)
     if (signer && signer !== account.address.toLowerCase()) {
       process.stderr.write(`${id} is not asked for: its voucher in ${stateDir} was signed by ${signer}, and this key, ${account.address}, cannot sign for it\n`)
       process.exit(2)
+    }
+    if (session) {
+      const answered = left.some((a) => String(a.channelId).toLowerCase() === id)
+      if (!answered) process.stderr.write(`${id} is an MPP session channel on ${session.escrow}: ${session.closed ? `its record in ${stateDir} shows it closed` : session.recorded ? `its record in ${stateDir} is not one this key, ${account.address}, opened at ${sellerOf(UPSTREAM)}` : `${stateDir} holds no record of it; run --refund or --refund --exit with the PASS_STATE_DIR that opened it`}. No x402 refund was asked for and no session channel was left.\n`)
+      process.exit(answered ? (sessionsLeft ? 1 : 0) : 2)
     }
     channelId = id
     channelGuessed = false
@@ -513,6 +520,10 @@ if (has('--refund')) {
   }
   if (answer.op === 'refund_signed') {
     log('the refund is signed and yours to send: any wallet on Base can send the transaction above')
+    process.exit(1)
+  }
+  if (answer.code === 'session_channel') {
+    log(`the seller says ${channelId} is an MPP session channel: --refund with the PASS_STATE_DIR that opened it closes it, and --refund --exit leaves it without the seller`)
     process.exit(1)
   }
   process.stderr.write([
@@ -603,6 +614,14 @@ const probedFor = (name, args) => {
 }
 const payFromProbe = async (name, args, required) => callPaid(name, args, await payments.createPaymentPayload(required))
 
+const noLine = (name) => {
+  const why = line.why ?? 'no line time could be had'
+  log(`${name}: PASS_LINE=on and no line could be had (${why}); a time tool is never paid per call under PASS_LINE=on`)
+  return { isError: true, content: [{ type: 'text', text: JSON.stringify({
+    error: 'pass_client_no_line', tool: name, why, msRemaining: Math.max(0, Math.round(line.msRemaining)),
+    message: `${name} is sold by time, and with PASS_LINE=on it rides a line and is never paid per call. No line could be had (${why}), so the call did not complete and nothing was paid per call. Try again, or set PASS_LINE=auto to pay its per-call price when no line can be had.` }) }] }
+}
+
 const exitingAnswer = () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
   error: 'pass_client_exiting', message: 'The Pass client is exiting: this call was not paid for or sent.' }) }] })
 
@@ -688,7 +707,7 @@ const IDLE_MS = Number(setting('LINE_IDLE_MS') ?? 1000)
 const EXIT_WAIT_MS = Number(setting('EXIT_WAIT_MS') ?? 30_000)
 let leaving = false
 
-const line = { credential: null, channel: null, msRemaining: 0, readAt: 0, metering: false, opening: null, offTimer: null, buys: 0, riding: 0, calls: 0, keeper: null, slowestBuyMs: 0, slowestDepositMs: 0, depositNext: false, capped: false, release: null }
+const line = { credential: null, channel: null, msRemaining: 0, readAt: 0, metering: false, opening: null, offTimer: null, buys: 0, riding: 0, calls: 0, keeper: null, slowestBuyMs: 0, slowestDepositMs: 0, depositNext: false, capped: false, release: null, why: null }
 const meterReads = (ms) => { line.msRemaining = Number(ms); line.readAt = Date.now() }
 const margin = () => marginFor(AHEAD_MS, slowestFor({ plainMs: line.slowestBuyMs, depositMs: line.slowestDepositMs, depositNext: line.depositNext }))
 const rate = { lastCallAt: 0, run: 0 }
@@ -764,6 +783,7 @@ const holdLine = () => {
     if (!on) return false
     const o = await openLine({ url: lineUrl(), channelId: on, signer: account, fetchFn: net })
     if (o.op !== 'opened') {
+      line.why = `the line was not opened: ${o.code}${o.why ? ` (${o.why})` : ''}`
       log(`line not opened: ${o.code}${o.why ? ` (${o.why})` : ''}`)
       if (o.code === 'unknown_channel' && on === channelId && !channelGuessed) {
         log(`the seller does not know ${on}, the channel ${stateDir} last paid with this key and PASS_SALT: asking which channel they pay here`)
@@ -786,6 +806,7 @@ const meterOn = async () => {
   if (line.metering) return true
   const a = await lineOp({ url: lineUrl(), op: 'on', credential: line.credential, fetchFn: net })
   if (a.op === 'on') { line.metering = true; meterReads(a.msRemaining ?? line.msRemaining); return true }
+  line.why = `the meter was not switched on: ${a.code}`
   if (LINE_GONE.has(a.code)) dropLine(a.code)
   return false
 }
@@ -802,6 +823,7 @@ const moveLine = () => {
 }
 
 const buyTime = async (wantMs, enough = () => false, running = null) => {
+  if (capReached) return false
   if (!seller.time) await tagOf('buy_time')
   if (!seller.time) return false
   if (offChannel()) {
@@ -839,7 +861,7 @@ const buyTime = async (wantMs, enough = () => false, running = null) => {
   if (skipped) return true
   if (offChannel() && line.calls === 0) moveLine()
   const b = bodyOf(out)
-  if (out?.isError || !b) { log(`buy_time: ${codeOf(out) ?? reasonFrom(out) ?? 'no answer'}`); return false }
+  if (out?.isError || !b) { line.why = `buy_time failed: ${codeOf(out) ?? reasonFrom(out) ?? 'no answer'}`; log(line.why); return false }
   line.buys += 1
   if (carried) line.slowestDepositMs = Math.max(line.slowestDepositMs, took)
   else line.slowestBuyMs = Math.max(line.slowestBuyMs, took)
@@ -900,11 +922,12 @@ const rideLine = async (name, args, needMs = 0) => {
   let want = Math.max(2 * margin(), Math.ceil(needMs * 1.25))
   let need = needMs > 0 ? want : MIN_BUY_MS
   for (let attempt = 0; attempt < 4; attempt++) {
-    if (capReached || leaving) break
+    if (leaving) break
     if (!(await holdLine())) return null
     if (!(await meterOn())) { if (!line.credential) continue; return null }
+    if (capReached && line.msRemaining <= 0) return lineSpent(name)
     const fill = line.msRemaining < need ? want : need
-    for (let buys = 0; line.msRemaining < fill && buys < 3; buys++) {
+    for (let buys = 0; !capReached && line.msRemaining < fill && buys < 3; buys++) {
       const had = line.msRemaining
       if (!(await buyTime(Math.max(MIN_BUY_MS, want - had), () => line.msRemaining >= fill))) { if (had >= MIN_BUY_MS) break; return null }
       if (line.msRemaining <= had) break
@@ -922,6 +945,7 @@ const rideLine = async (name, args, needMs = 0) => {
       if (code && line.readAt <= endedAt) meterReads(bodyOf(out)?.msRemaining ?? 0)
       if (line.capped || capReached) {
         log(`${name} ended when its line ran out of time: PASS_MAX_SPEND stopped the Pass client buying more`)
+        if (capReached) letGo('spend cap reached').catch(() => {})
         return capAnswer(`${name} ran until its line ran out of time and ended there unanswered: buying more time would go over the PASS_MAX_SPEND ceiling, so no more was bought. Raise it, set PASS_MAX_SPEND=0 to remove it, or restart the Pass client.`)
       }
     }
@@ -952,6 +976,12 @@ const reasonFrom = (out) => {
 
 const capFigures = () => ({ spentMicroUSD: spentMicroUSD + fetchSpent, capMicroUSD: MAX_SPEND })
 const notPaid = (name) => log(`PASS_MAX_SPEND is ${MAX_SPEND} and ${spentMicroUSD + fetchSpent} is spent: ${name} was not paid for`)
+const lineSpent = (name) => {
+  notPaid(name)
+  letGo('spend cap reached').catch(() => {})
+  return capAnswer(`${name} was not sent: its line has no time left, and buying more would go over the PASS_MAX_SPEND ceiling, so none was bought. Raise it, set PASS_MAX_SPEND=0 to remove it, or restart the Pass client.`, { msRemaining: Math.max(0, Math.round(line.msRemaining)) })
+}
+const ridesPaidTime = (timed) => timed && LINE_MODE !== 'off' && (LINE_MODE === 'on' || Boolean(line.credential && line.msRemaining > 0))
 
 const capAnswer = (message = 'This payment would go over the PASS_MAX_SPEND ceiling, so it was not made. ' +
   'Raise it, set PASS_MAX_SPEND=0 to remove it, or restart the Pass client.', more = {}) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
@@ -1029,7 +1059,7 @@ const cutAfterMs = (tag, out) => {
 
 const callWithin = async (name, args) => {
   if (isFetchTool(name) && fetchTool) return fetchCapped(name, await fetchTool(args, { signal: asked.getStore() ?? undefined }))
-  if (capReached) return capAnswer()
+  if (capReached && name === 'buy_time') return capAnswer()
   if (KEYLESS) return callFree(name, args)
   if (name === 'buy_time') {
     const out = await payFirst(name, args)
@@ -1039,14 +1069,16 @@ const callWithin = async (name, args) => {
   }
   const tag = await tagOf(name)
   const timed = isTimeTag(tag)
+  if (capReached && !ridesPaidTime(timed)) return capAnswer()
   const fast = timed && LINE_MODE !== 'off' ? callsKeepComing() : false
-  const riding = timed && LINE_MODE !== 'off' && (LINE_MODE === 'on' || Boolean(line.credential && line.msRemaining > 0))
+  const riding = ridesPaidTime(timed)
   if (!riding) {
     const out = await bySession(name, args, timed)
     if (out !== undefined) return out
   }
   if (!timed || LINE_MODE === 'off') return payFirst(name, args)
   const worth = riding || fast
+  if (LINE_MODE === 'on') line.why = null
   const unopened = worth && LINE_MODE === 'on' && channelId && !channelGuessed && !line.credential ? !(await holdLine()) && !channelGuessed : false
   if (worth && (!channelId || channelGuessed) && LINE_MODE === 'on' && !(await holdLine())) {
     log(`${name} is sold by time: buying time first, so this call rides a line`)
@@ -1056,6 +1088,8 @@ const callWithin = async (name, args) => {
     const out = await ride(name, args)
     if (out) return out
   }
+  if (capReached) return capAnswer()
+  if (LINE_MODE === 'on') return leaving ? exitingAnswer() : noLine(name)
   const out = await payFirst(name, args)
   const code = codeOf(out)
   if ((code === 'out_of_time' || code === 'line_required') && channelId) {

@@ -3,7 +3,7 @@
   "name": "com.zeamprism/pass-client",
   "title": "@zeampass/client",
   "description": "The buyer side of ZEAM :: Pass: a wallet in front of a paid MCP server or URL. Pays by x402 or MPP.",
-  "version": "4.1.1",
+  "version": "4.1.2",
   "websiteUrl": "https://zeampass.com/agents",
   "repository": {
     "url": "https://github.com/zeam-labs/pass-client",
@@ -14,7 +14,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@zeampass/client",
-      "version": "4.1.1",
+      "version": "4.1.2",
       "transport": {
         "type": "stdio"
       },

@@ -892,9 +892,9 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
     }, failed)
   }
 
-  const leave = async ({ dir, origin = null, transportFor, forced = false, selfSend = false, wallet = null }) => {
+  const leave = async ({ dir, origin = null, channelId = null, transportFor, forced = false, selfSend = false, wallet = null }) => {
     const out = []
-    for (const r of seatFor(dir).store.open().filter((x) => same(x.payer, payer) && x.chainId === chainId && (!origin || x.origin === origin))) {
+    for (const r of seatFor(dir).store.open().filter((x) => same(x.payer, payer) && x.chainId === chainId && (!origin || x.origin === origin) && (!channelId || same(x.channelId, channelId)))) {
       if (forced || selfSend || r.exit) { out.push(await exit({ dir, channelId: r.channelId, selfSend, wallet })); continue }
       let requested = false
       try { const c = await chainOf(r); requested = c.exists && !c.finalized && c.closeRequestedAt > 0 } catch {}
@@ -905,5 +905,14 @@ export function makeSessions({ signer, pub, network, trust, mode = 'auto', budge
     return out
   }
 
-  return { mode, trust, payer, pay, close, exit, leave, usable, holds, channels: (dir) => seatFor(dir).store.all() }
+  const sessionOf = async (dir, channelId) => {
+    const r = seatFor(dir).store.get(channelId)
+    if (r) return { channelId: r.channelId, escrow: r.escrow, recorded: true, closed: Boolean(r.closed) }
+    for (const { escrow } of trust.list) {
+      try { if ((await chainOf({ escrow, channelId })).exists) return { channelId, escrow, recorded: false, closed: false } } catch {}
+    }
+    return null
+  }
+
+  return { mode, trust, payer, pay, close, exit, leave, sessionOf, usable, holds, channels: (dir) => seatFor(dir).store.all() }
 }
